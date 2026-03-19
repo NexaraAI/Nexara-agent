@@ -107,6 +107,29 @@ class SkillLoader:
             return True
         return self._ctx.platform.value in platforms
 
+    async def load(self) -> list[str]:
+        """Master entrypoint: loads local skills, then fetches manifest and remote skills."""
+        # 1. Load any local fallback skills
+        self.load_local()
+
+        # 2. Fetch the manifest.json from the GitHub warehouse
+        manifest = {}
+        try:
+            manifest_url = f"{self._warehouse}/manifest.json"
+            async with httpx.AsyncClient(timeout=10) as client:
+                r = await client.get(manifest_url)
+                r.raise_for_status()
+                manifest = r.json()
+                logger.info("Manifest fetched successfully.")
+        except Exception as exc:
+            logger.error("Failed to fetch manifest from warehouse: %s", exc)
+
+        # 3. Fetch remote skills securely
+        if manifest:
+            await self.fetch_remote(manifest)
+
+        return self._loaded
+
     def load_local(self):
         """Phase 1: Load pre-packaged skills from local directory."""
         if not LOCAL_SKILL_DIR.exists():
