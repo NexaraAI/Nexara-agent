@@ -18,10 +18,18 @@ _skill_cache: dict = {}
 # Bridges set at boot time by main.py
 _memory_bridge:    "MemoryBridge | None"    = None
 _scheduler_bridge: "SchedulerBridge | None" = None
+_active_skills:    list[str]                = []
 
 
 def set_memory_bridge(bridge):    global _memory_bridge;    _memory_bridge    = bridge
 def set_scheduler_bridge(bridge): global _scheduler_bridge; _scheduler_bridge = bridge
+
+def set_active_skills(skills: list[str]):
+    global _active_skills
+    _active_skills = skills
+
+def get_active_skills() -> list[str]:
+    return _active_skills
 
 
 def _get_skill(name: str):
@@ -74,12 +82,19 @@ async def execute_skill(name: str, kwargs: dict) -> SkillResult:
 def skill_descriptions() -> str:
     reg = SkillMeta.get_registry()
     lines = []
+    
+    # Only show descriptions for dynamically loaded/active skills
     for name, cls in sorted(reg.items()):
+        if _active_skills and name not in _active_skills:
+            continue
         lines.append(f"- **{name}**: {getattr(cls, 'description', '')}")
-    # Memory + scheduler (virtual skills)
+        
+    # Memory + scheduler (virtual skills always available)
     lines.append("- **remember**: Store a fact in long-term memory")
     lines.append("- **recall**: Search long-term memory semantically")
     lines.append("- **schedule_task**: Schedule a recurring autonomous task")
     lines.append("- **list_schedules**: List all scheduled tasks")
     lines.append("- **cancel_schedule**: Cancel a scheduled task by ID")
+    
     return "\n".join(lines)
+
