@@ -1,0 +1,253 @@
+name: DemonZ Workspace Deployment Pipeline
+
+# ═════════════════════════════════════════════════════════════════════════════
+# DemonZ Deployer — Pipeline v2.0.3  |  2026-03-18
+# ─────────────────────────────────────────────────────────────────────────────
+# Changelog:
+#   v2.0.3 — Concurrency guard prevents double-deploy race conditions.
+#             stat-based size check replaces inaccurate du -m.
+#             Self-protection exclude prevents workspace zip from overwriting
+#             this pipeline file (Reinstall Workflow button unaffected).
+#             OS pinned to ubuntu-24.04 (was moving ubuntu-latest target).
+#             checkout action pinned to commit SHA (supply-chain hardening).
+#             workflows: write removed — was invalid, caused all runs to fail.
+#   v2.0.2 — Initial professional rewrite. Staged extraction, rsync overlay,
+#             ZIP integrity + path traversal validation, push retry loop,
+#             single-root folder flattening, job summary report.
+# ═════════════════════════════════════════════════════════════════════════════
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Triggers on any push that touches workspace.zip on any branch.
+# To restrict to a single branch, add: branches: [ main ]
+# ─────────────────────────────────────────────────────────────────────────────
+on:
+  push:
+    paths:
+      - 'workspace.zip'
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GITHUB_TOKEN permissions — minimal, explicit.
+# contents: write — required to commit and push extracted files.
+#
+# NOTE on workflow files: GITHUB_TOKEN can NEVER push .github/workflows/*.yml
+# files regardless of any permissions setting — this is a hard GitHub
+# platform restriction. If your workspace zip contains workflow files, you
+# must use a PAT with the `workflow` OAuth scope instead.
+#
+# To enable workflow-file pushes:
+#   1. GitHub → Settings → Developer settings → Personal access tokens
+#   2. Create a fine-grained PAT: Contents (write) + Workflows (write)
+#   3. Add it as a repo secret named DEPLOY_TOKEN
+#   4. Replace both `secrets.GITHUB_TOKEN` references below with
+#      `secrets.DEPLOY_TOKEN`
+# ─────────────────────────────────────────────────────────────────────────────
+permissions:
+  contents: write
+
+env:
+  PAYLOAD_FILE: 'workspace.zip'
+  EXTRACT_DIR:  '__workspace_extract__'
+  BOT_NAME:     'DemonZ Deployer Bot'
+  BOT_EMAIL:    'deployer@demonz.dev'
+  COMMIT_MSG:   'build(sync): update workspace via DemonZ Deployer'
+  MAX_SIZE_MB:  '100'
+
+jobs:
+  extract-and-sync:
+    name: Extract Payload and Synchronize Workspace
+
+    # FIX 4: Pin to a specific Ubuntu version rather than the moving
+    # `ubuntu-latest` target, so tool behaviour is fully reproducible.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    # FIX 1: Concurrency guard — if two deploys land in quick succession,
+    # the second run queues and waits rather than racing to push on top of
+    # the first, which would cause a non-fast-forward push failure.
+    concurrency:
+      group: deploy-${{ github.ref }}
+      cancel-in-progress: false
+
+    steps:
+
+      # ── 1. Checkout ────────────────────────────────────────────────────────
+      # FIX 5: Pinned to commit SHA instead of the mutable @v4 tag to prevent
+      # supply-chain attacks. Pin = actions/checkout v4.2.2.
+      # To push workflow files swap GITHUB_TOKEN → DEPLOY_TOKEN (see above).
+      - name: Checkout Repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          fetch-depth: 1
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      # ── 2. Payload validation ──────────────────────────────────────────────
+      - name: Validate Payload
+        run: |
+          set -euo pipefail
+
+          echo "── Payload Validation ──────────────────────────────"
+
+          # Existence check
+          if [ ! -f "${{ env.PAYLOAD_FILE }}" ]; then
+            echo "::error::Payload file '${{ env.PAYLOAD_FILE }}' not found in repository root."
+            exit 1
+          fi
+
+          # FIX 2: Use stat for exact byte count instead of du -m, which
+          # rounds up to the nearest disk block and causes false rejections.
+          SIZE_BYTES=$(stat -c%s "${{ env.PAYLOAD_FILE }}")
+          SIZE_MB=$((SIZE_BYTES / 1048576))
+          echo "Payload size: ${SIZE_MB} MB (${SIZE_BYTES} bytes) — limit: ${{ env.MAX_SIZE_MB }} MB"
+          if [ "$SIZE_MB" -gt "${{ env.MAX_SIZE_MB }}" ]; then
+            echo "::error::Payload exceeds the ${{ env.MAX_SIZE_MB }} MB limit (${SIZE_MB} MB). Aborting."
+            exit 1
+          fi
+
+          # ZIP integrity check — catches corrupted or truncated uploads
+          if ! unzip -t "${{ env.PAYLOAD_FILE }}" > /dev/null 2>&1; then
+            echo "::error::Payload failed ZIP integrity test. The archive may be corrupted or truncated."
+            exit 1
+          fi
+
+          # Path traversal check — reject any entry containing '..'
+          TRAVERSAL=$(unzip -l "${{ env.PAYLOAD_FILE }}" | awk '{print $NF}' | grep '\.\.' || true)
+          if [ -n "$TRAVERSAL" ]; then
+            echo "::error::Payload contains path traversal entries (..). Aborting for security."
+            echo "$TRAVERSAL"
+            exit 1
+          fi
+
+          echo "Payload valid. Proceeding."
+
+      # ── 3. Extract to staging directory ───────────────────────────────────
+      - name: Extract Workspace Payload
+        run: |
+          set -euo pipefail
+
+          echo "── Extraction ──────────────────────────────────────"
+
+          # Extract into a clean staging directory first — never directly
+          # into repo root. Prevents partial overwrites if unzip fails midway.
+          rm -rf "${{ env.EXTRACT_DIR }}"
+          mkdir -p "${{ env.EXTRACT_DIR }}"
+
+          unzip -q -o "${{ env.PAYLOAD_FILE }}" -d "${{ env.EXTRACT_DIR }}"
+          echo "Archive extracted to staging directory."
+
+          # Count extracted files for the job summary
+          FILE_COUNT=$(find "${{ env.EXTRACT_DIR }}" -type f | wc -l | tr -d ' ')
+          echo "EXTRACTED_FILES=$FILE_COUNT" >> $GITHUB_ENV
+
+          # Detect a single root folder (common with Android/Termux zip tools)
+          # and flatten it so files land correctly at repo root level.
+          ROOTS=$(ls -1 "${{ env.EXTRACT_DIR }}" | wc -l | tr -d ' ')
+          FIRST=$(ls -1 "${{ env.EXTRACT_DIR }}" | head -1)
+          if [ "$ROOTS" -eq 1 ] && [ -d "${{ env.EXTRACT_DIR }}/$FIRST" ]; then
+            echo "Single root folder '$FIRST' detected — flattening."
+            mv "${{ env.EXTRACT_DIR }}/$FIRST"/* "${{ env.EXTRACT_DIR }}/" 2>/dev/null || true
+            mv "${{ env.EXTRACT_DIR }}/$FIRST"/.[!.]* "${{ env.EXTRACT_DIR }}/" 2>/dev/null || true
+            rmdir "${{ env.EXTRACT_DIR }}/$FIRST" 2>/dev/null || true
+          fi
+
+          echo "Staging complete. $FILE_COUNT files ready to sync."
+
+      # ── 4. Sync staging → repo root ───────────────────────────────────────
+      - name: Sync Files to Repository Root
+        run: |
+          set -euo pipefail
+
+          echo "── Sync ────────────────────────────────────────────"
+
+          # rsync overlays extracted files onto repo root.
+          # FIX 3: deployer-pipeline.yml is explicitly excluded so a workspace
+          # zip can never accidentally overwrite the running pipeline. The
+          # Reinstall Workflow button in the Deployer app uses the GitHub
+          # Contents API directly and is unaffected by this exclude.
+          rsync -av --progress \
+            --exclude='.git/' \
+            --exclude='workspace.zip' \
+            --exclude="${{ env.EXTRACT_DIR }}/" \
+            --exclude='.github/workflows/deployer-pipeline.yml' \
+            "${{ env.EXTRACT_DIR }}/" .
+
+          # Clean up staging directory
+          rm -rf "${{ env.EXTRACT_DIR }}"
+          echo "Staging directory removed."
+
+          # Remove the payload archive — must not persist in the repo
+          rm -f "${{ env.PAYLOAD_FILE }}"
+          echo "Payload archive removed."
+
+      # ── 5. Configure Git identity ──────────────────────────────────────────
+      - name: Configure Git Identity
+        run: |
+          git config --local user.name  "${{ env.BOT_NAME }}"
+          git config --local user.email "${{ env.BOT_EMAIL }}"
+
+      # ── 6. Commit and push ─────────────────────────────────────────────────
+      - name: Commit and Push Synchronized Data
+        run: |
+          set -euo pipefail
+
+          echo "── Commit ──────────────────────────────────────────"
+          git add -A
+
+          if git diff-index --quiet HEAD --; then
+            echo "No structural changes detected. Repository is already up to date."
+            echo "COMMITTED=false" >> $GITHUB_ENV
+            exit 0
+          fi
+
+          # Richer commit message includes file change stats
+          STATS=$(git diff --cached --shortstat)
+          git commit -m "${{ env.COMMIT_MSG }}" -m "Stats: $STATS"
+
+          SHA=$(git rev-parse HEAD)
+          echo "COMMIT_SHA=$SHA" >> $GITHUB_ENV
+          echo "COMMITTED=true"  >> $GITHUB_ENV
+          echo "Committed: $SHA"
+
+          # Push with retry logic for transient remote failures
+          for attempt in 1 2 3; do
+            if git push; then
+              echo "Push succeeded on attempt $attempt."
+              break
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              echo "::error::Push failed after 3 attempts."
+              exit 1
+            fi
+            echo "Push attempt $attempt failed — retrying in 5 seconds…"
+            sleep 5
+          done
+
+          echo "Synchronization complete."
+
+      # ── 7. Job summary ─────────────────────────────────────────────────────
+      - name: Write Job Summary
+        if: always()
+        run: |
+          echo "## DemonZ Deployer — Sync Report" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [ "${COMMITTED:-}" = "true" ]; then
+            echo "### ✅ Deployment Successful" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
+            echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+            echo "| **Commit SHA** | \`${COMMIT_SHA:-n/a}\` |" >> $GITHUB_STEP_SUMMARY
+            echo "| **Files extracted** | ${EXTRACTED_FILES:-n/a} |" >> $GITHUB_STEP_SUMMARY
+            echo "| **Branch** | \`${{ github.ref_name }}\` |" >> $GITHUB_STEP_SUMMARY
+            echo "| **Triggered by** | \`${{ github.actor }}\` |" >> $GITHUB_STEP_SUMMARY
+            echo "| **Repository** | \`${{ github.repository }}\` |" >> $GITHUB_STEP_SUMMARY
+          elif [ "${COMMITTED:-}" = "false" ]; then
+            echo "### ℹ️ No Changes Detected" >> $GITHUB_STEP_SUMMARY
+            echo "The extracted workspace was identical to the current state. No commit was made." >> $GITHUB_STEP_SUMMARY
+          else
+            echo "### ❌ Deployment Failed" >> $GITHUB_STEP_SUMMARY
+            echo "The pipeline encountered an error. Check the step logs above for details." >> $GITHUB_STEP_SUMMARY
+          fi
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "---" >> $GITHUB_STEP_SUMMARY
+          echo "*Forging Digital Empires — DemonZ Development*" >> $GITHUB_STEP_SUMMARY
