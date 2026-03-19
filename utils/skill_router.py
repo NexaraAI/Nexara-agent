@@ -82,19 +82,18 @@ async def execute_skill(name: str, kwargs: dict) -> SkillResult:
 def skill_descriptions() -> str:
     reg = SkillMeta.get_registry()
     lines = []
-    
+
     # Only show descriptions for dynamically loaded/active skills
     for name, cls in sorted(reg.items()):
         if _active_skills and name not in _active_skills:
             continue
-        lines.append(f"- **{name}**: {getattr(cls, 'description', '')}")
-        
-    # Memory + scheduler (virtual skills always available)
-    lines.append("- **remember**: Store a fact in long-term memory")
-    lines.append("- **recall**: Search long-term memory semantically")
-    lines.append("- **schedule_task**: Schedule a recurring autonomous task")
-    lines.append("- **list_schedules**: List all scheduled tasks")
-    lines.append("- **cancel_schedule**: Cancel a scheduled task by ID")
-    
-    return "\n".join(lines)
+        lines.append(f"- `{name}`: {getattr(cls, 'description', '')}")
 
+    # Memory + scheduler (virtual skills always available)
+    lines.append("- `remember`: Store a fact in long-term memory")
+    lines.append("- `recall`: Search long-term memory semantically")
+    lines.append("- `schedule_task`: Schedule a recurring autonomous task")
+    lines.append("- `list_schedules`: List all scheduled tasks")
+    lines.append("- `cancel_schedule`: Cancel a scheduled task by ID")
+
+    return "\n".join(lines)
