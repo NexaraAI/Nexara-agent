@@ -1,0 +1,36 @@
+# Nexara Agent V1.0 — Requirements
+# Python 3.11+ / 3.13 compatible
+
+# Telegram
+python-telegram-bot>=22.6
+
+# HTTP + async I/O
+httpx[socks]==0.27.2
+aiofiles>=23.2.1
+requests>=2.31.0
+
+# LLM providers
+google-generativeai>=0.7.0
+openai>=1.30.0              # used for Groq (OpenAI-compatible SDK)
+
+# Semantic memory
+sentence-transformers>=3.0.0
+numpy>=1.26.0
+
+# HTML parsing
+beautifulsoup4>=4.12.0
+lxml>=5.1.0
+
+# Environment + scheduling
+python-dotenv>=1.0.0
+apscheduler>=3.10.4
+
+# System monitoring
+psutil>=5.9.0
+
+# File intelligence
+pdfplumber>=0.11.0          # PDF text extraction
+Pillow>=10.0.0              # image metadata
+
+# Video downloads
+yt-dlp>=2024.1.1
