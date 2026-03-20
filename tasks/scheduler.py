@@ -1,7 +1,16 @@
 """
-tasks/scheduler.py
-Natural language schedule parser → APScheduler jobs.
-Now features autonomous SQLite persistence: surviving restarts seamlessly.
+tasks/scheduler.py — Nexara V1
+Natural language schedule parser -> APScheduler jobs.
+Persistent via SQLite + one-off DateTrigger support.
+
+Fixes applied:
+  - Concurrency guard: a running job will not fire again before it finishes.
+    Previously, if a proactive job took >interval seconds, APScheduler would
+    stack multiple concurrent runs of the same job, spiralling into dozens of
+    parallel agent loops that could exhaust all LLM quota.
+  - _fire wrapped in try/except/finally — unhandled exceptions inside a job
+    were silently swallowed by APScheduler, leaving _running in a dirty state.
+  - Cleanup of one-off jobs moved to finally block (was missing on error path).
 """
 
 import asyncio
@@ -10,12 +19,14 @@ import re
 import sqlite3
 import uuid
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Awaitable
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from apscheduler.triggers.cron     import CronTrigger
-from apscheduler.triggers.interval import IntervalTrigger
+from apscheduler.triggers.cron      import CronTrigger
+from apscheduler.triggers.interval  import IntervalTrigger
+from apscheduler.triggers.date      import DateTrigger
 
 logger = logging.getLogger("nexara.scheduler")
 
@@ -26,7 +37,7 @@ TASKS_DB = Path.home() / ".nexara" / "tasks.db"
 class ScheduledJob:
     job_id:       str
     goal:         str
-    schedule:     str   # human-readable schedule string
+    schedule:     str
     trigger_desc: str
 
 
@@ -40,6 +51,7 @@ class NaturalScheduler:
         self._submit  = submit_fn
         self._sched   = AsyncIOScheduler(timezone="UTC")
         self._jobs:   dict[str, ScheduledJob] = {}
+        self._running: set[str] = set()   # jobs currently executing
         self._started = False
         self._init_db()
 
@@ -64,17 +76,22 @@ class NaturalScheduler:
     async def stop(self):
         self._sched.shutdown(wait=False)
 
-    # ── Persistence / Loading ─────────────────────────────────────────────────
+    # ── Persistence ───────────────────────────────────────────────────────────
 
     async def _load_persisted_jobs(self):
         def _read():
             with sqlite3.connect(TASKS_DB) as conn:
                 conn.row_factory = sqlite3.Row
                 return conn.execute("SELECT * FROM schedules").fetchall()
-        
+
         rows = await asyncio.to_thread(_read)
         for r in rows:
             trigger, _ = self._parse(r["schedule"])
+
+            if isinstance(trigger, DateTrigger) and trigger.run_date < datetime.now(timezone.utc):
+                asyncio.create_task(self._delete_job(r["job_id"]))
+                continue
+
             if trigger:
                 self._sched.add_job(
                     self._fire,
@@ -83,7 +100,7 @@ class NaturalScheduler:
                     args=[r["job_id"]],
                     max_instances=1,
                     replace_existing=True,
-                    misfire_grace_time=300, # Give it 5 mins grace on restart
+                    misfire_grace_time=300,
                 )
                 self._jobs[r["job_id"]] = ScheduledJob(
                     job_id=r["job_id"],
@@ -98,8 +115,9 @@ class NaturalScheduler:
         def _write():
             with sqlite3.connect(TASKS_DB) as conn:
                 conn.execute(
-                    "INSERT OR REPLACE INTO schedules (job_id, goal, schedule, trigger_desc) VALUES (?, ?, ?, ?)",
-                    (job.job_id, job.goal, job.schedule, job.trigger_desc)
+                    "INSERT OR REPLACE INTO schedules (job_id, goal, schedule, trigger_desc) "
+                    "VALUES (?, ?, ?, ?)",
+                    (job.job_id, job.goal, job.schedule, job.trigger_desc),
                 )
         await asyncio.to_thread(_write)
 
@@ -109,17 +127,26 @@ class NaturalScheduler:
                 conn.execute("DELETE FROM schedules WHERE job_id = ?", (job_id,))
         await asyncio.to_thread(_write)
 
-    # ── Register ──────────────────────────────────────────────────────────────
+    # ── Register / Cancel ─────────────────────────────────────────────────────
 
     async def schedule(self, goal: str, schedule_str: str, job_id: str | None = None) -> str:
         jid = job_id or f"sched_{uuid.uuid4().hex[:6]}"
 
+        if not schedule_str or not schedule_str.strip():
+            return (
+                "ERROR: Empty schedule string. "
+                "Specify a time, e.g. 'every day at 8am' or 'in 5 minutes'."
+            )
+
         trigger, desc = self._parse(schedule_str)
         if trigger is None:
             return (
-                f"❌ Couldn't parse schedule: `{schedule_str}`\n\n"
-                "Try: 'every 30 minutes', 'every day at 9am', "
-                "'every monday at noon', 'every hour'"
+                f"ERROR: Unrecognised schedule format: '{schedule_str}'\n"
+                "Supported formats:\n"
+                "- 'in 5 minutes' / 'in 2 hours'\n"
+                "- 'every 30 minutes'\n"
+                "- 'every day at 9am'\n"
+                "- 'every monday at noon'"
             )
 
         self._sched.add_job(
@@ -132,46 +159,69 @@ class NaturalScheduler:
             misfire_grace_time=120,
         )
 
-        job = ScheduledJob(
-            job_id=jid,
-            goal=goal,
-            schedule=schedule_str,
-            trigger_desc=desc,
-        )
+        job = ScheduledJob(job_id=jid, goal=goal, schedule=schedule_str, trigger_desc=desc)
         self._jobs[jid] = job
         await self._save_job(job)
-        
-        logger.info("Scheduled job '%s': %s → %s", jid, desc, goal[:60])
-        return f"⏰ Scheduled `{jid}`: _{goal[:60]}_\n🕐 Runs: **{desc}**"
+        logger.info("Scheduled job '%s': %s -> %s", jid, desc, goal[:60])
+        return f"Scheduled '{jid}': {goal[:60]}\nRuns: {desc}"
 
     async def cancel(self, job_id: str) -> str:
         if job_id not in self._jobs:
-            return f"No scheduled job with ID `{job_id}`."
+            return f"No scheduled job with ID '{job_id}'."
         try:
             self._sched.remove_job(job_id)
         except Exception:
             pass
-        
         del self._jobs[job_id]
+        self._running.discard(job_id)
         await self._delete_job(job_id)
-        return f"🗑️ Schedule `{job_id}` cancelled."
+        return f"Schedule '{job_id}' cancelled."
 
     def list_jobs(self) -> str:
         if not self._jobs:
             return "No scheduled tasks."
-        lines = ["⏰ **Scheduled Tasks**\n"]
+        lines = ["Scheduled Tasks\n"]
         for j in self._jobs.values():
-            lines.append(f"• `{j.job_id}` — {j.goal[:60]}\n  🕐 {j.trigger_desc}")
+            running = " (running)" if j.job_id in self._running else ""
+            lines.append(f"- {j.job_id}: {j.goal[:60]}\n  Runs: {j.trigger_desc}{running}")
         return "\n".join(lines)
 
     # ── Fire ──────────────────────────────────────────────────────────────────
 
     async def _fire(self, job_id: str):
+        """
+        Execute a scheduled job.
+
+        Concurrency guard: if the same job is still running from a previous
+        fire (e.g. agent took longer than the interval), skip this trigger
+        rather than stacking a second parallel execution.
+        """
         job = self._jobs.get(job_id)
         if not job:
             return
+
+        if job_id in self._running:
+            logger.warning(
+                "Job '%s' already running — skipping this trigger to avoid stacking.", job_id
+            )
+            return
+
+        self._running.add(job_id)
         logger.info("Firing scheduled job '%s': %s", job_id, job.goal[:60])
-        await self._submit(job.goal, f"Scheduled: {job.trigger_desc}")
+
+        is_oneoff = "Once in" in job.trigger_desc
+
+        try:
+            await self._submit(job.goal, f"Scheduled: {job.trigger_desc}")
+        except Exception as exc:
+            logger.error("Scheduled job '%s' raised an error: %s", job_id, exc)
+        finally:
+            self._running.discard(job_id)
+            if is_oneoff and job_id in self._jobs:
+                try:
+                    await self.cancel(job_id)
+                except Exception:
+                    pass
 
     # ── Natural language parser ───────────────────────────────────────────────
 
@@ -179,62 +229,73 @@ class NaturalScheduler:
     def _parse(text: str) -> tuple:
         """
         Returns (APScheduler trigger, human description) or (None, None).
-        Handles: intervals, time-of-day, day-of-week, combined.
+        Handles intervals, time-of-day, day-of-week, combined, one-off delays.
         """
         t = text.lower().strip()
 
-        # ── Interval patterns ─────────────────────────────────────────────────
+        # One-off: "in 5 minutes"
+        m = re.search(r"^in\s+(\d+)\s+(second|minute|hour|day)s?", t)
+        if m:
+            qty  = int(m.group(1))
+            unit = m.group(2)
+            run_date = datetime.now(timezone.utc) + timedelta(**{f"{unit}s": qty})
+            return DateTrigger(run_date=run_date), f"Once in {qty} {unit}(s)"
+
+        # Interval: "every 30 minutes"
         m = re.search(r"every\s+(\d+)\s+(second|minute|hour|day)s?", t)
         if m:
             qty  = int(m.group(1))
             unit = m.group(2)
-            kwargs = {f"{unit}s": qty}
-            return IntervalTrigger(**kwargs), f"Every {qty} {unit}(s)"
+            return IntervalTrigger(**{f"{unit}s": qty}), f"Every {qty} {unit}(s)"
 
+        # Shorthand: "every minute/hour/day/week"
         m = re.search(r"every\s+(minute|hour|day|week)(?!\s+\d)", t)
         if m:
-            unit = m.group(1)
             mapping = {
-                "minute": (IntervalTrigger(minutes=1),  "Every minute"),
-                "hour":   (IntervalTrigger(hours=1),    "Every hour"),
-                "day":    (CronTrigger(hour=0,minute=0), "Every day at midnight"),
+                "minute": (IntervalTrigger(minutes=1),            "Every minute"),
+                "hour":   (IntervalTrigger(hours=1),              "Every hour"),
+                "day":    (CronTrigger(hour=0, minute=0),         "Every day at midnight"),
                 "week":   (CronTrigger(day_of_week="mon", hour=0, minute=0), "Every Monday"),
             }
-            return mapping.get(unit, (None, None))
+            return mapping.get(m.group(1), (None, None))
 
-        # ── Time extraction ───────────────────────────────────────────────────
+        # Time extraction
         hour, minute = None, 0
-        am_pm_m = re.search(r"(\d{1,2})(?::(\d{2}))?\s*(am|pm)", t)
-        if am_pm_m:
-            hour   = int(am_pm_m.group(1))
-            minute = int(am_pm_m.group(2) or 0)
-            if am_pm_m.group(3) == "pm" and hour != 12: hour += 12
-            elif am_pm_m.group(3) == "am" and hour == 12: hour = 0
+        am_pm = re.search(r"(\d{1,2})(?::(\d{2}))?\s*(am|pm)", t)
+        if am_pm:
+            hour   = int(am_pm.group(1))
+            minute = int(am_pm.group(2) or 0)
+            if am_pm.group(3) == "pm" and hour != 12:
+                hour += 12
+            elif am_pm.group(3) == "am" and hour == 12:
+                hour = 0
 
-        named_times = {
+        for name, (h, mn) in {
             "midnight": (0, 0), "noon": (12, 0), "midday": (12, 0),
             "morning":  (8, 0), "evening": (18, 0), "night": (21, 0),
-        }
-        for name, (h, mn) in named_times.items():
+        }.items():
             if name in t:
                 hour, minute = h, mn
                 break
 
-        # ── Day-of-week ───────────────────────────────────────────────────────
+        # Day of week
         days = {
             "monday": "mon", "tuesday": "tue", "wednesday": "wed",
             "thursday": "thu", "friday": "fri", "saturday": "sat", "sunday": "sun",
         }
         dow = next((code for name, code in days.items() if name in t), None)
 
-        # ── Build trigger ─────────────────────────────────────────────────────
         if dow and hour is not None:
-            return CronTrigger(day_of_week=dow, hour=hour, minute=minute), f"Every {dow.capitalize()} at {hour:02d}:{minute:02d}"
-        if dow and hour is None:
-            return CronTrigger(day_of_week=dow, hour=0, minute=0), f"Every {dow.capitalize()} at midnight"
+            return CronTrigger(day_of_week=dow, hour=hour, minute=minute), \
+                   f"Every {dow.capitalize()} at {hour:02d}:{minute:02d}"
+        if dow:
+            return CronTrigger(day_of_week=dow, hour=0, minute=0), \
+                   f"Every {dow.capitalize()} at midnight"
         if hour is not None and any(x in t for x in ["every day", "daily", "each day"]):
-            return CronTrigger(hour=hour, minute=minute), f"Every day at {hour:02d}:{minute:02d}"
+            return CronTrigger(hour=hour, minute=minute), \
+                   f"Every day at {hour:02d}:{minute:02d}"
         if hour is not None:
-            return CronTrigger(hour=hour, minute=minute), f"Daily at {hour:02d}:{minute:02d}"
+            return CronTrigger(hour=hour, minute=minute), \
+                   f"Daily at {hour:02d}:{minute:02d}"
 
         return None, None

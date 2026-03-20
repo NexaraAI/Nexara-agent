@@ -13,6 +13,7 @@ Multi-provider LLM router with:
 import asyncio
 import json
 import logging
+import re as _re
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -46,8 +47,8 @@ LLMResponse = ToolCall | TextResponse | AskUser
 class ResponseMeta:
     provider: str
     model:    str
-    elapsed:  float   # seconds
-    tokens:   int     # estimated
+    elapsed:  float
+    tokens:   int
 
     def badge(self) -> str:
         icons = {"groq": "⚡", "gemini": "🔵", "nvidia": "🟢", "ollama": "📡"}
@@ -63,7 +64,6 @@ class Provider(Enum):
     NVIDIA = "nvidia"
     OLLAMA = "ollama"
 
-# Tokens per minute limits (free tiers)
 _LIMITS = {
     Provider.GROQ:   6_000,
     Provider.GEMINI: 32_000,
@@ -71,16 +71,15 @@ _LIMITS = {
     Provider.OLLAMA: 999_999,
 }
 
-_SOFT_PCT = 0.80  # switch provider at 80% of limit
+_SOFT_PCT = 0.80
 
 
 @dataclass
 class ProviderHealth:
-    provider:     Provider
-    failures:     int   = 0
-    last_failure: float = 0.0
-    cooldown_s:   float = 60.0
-    # Token tracking
+    provider:        Provider
+    failures:        int   = 0
+    last_failure:    float = 0.0
+    cooldown_s:      float = 5.0
     tokens_this_min: int   = 0
     min_start:       float = field(default_factory=time.time)
 
@@ -106,13 +105,14 @@ class ProviderHealth:
     def record_failure(self):
         self.failures    += 1
         self.last_failure = time.time()
-        self.cooldown_s   = min(600.0, 60.0 * (2 ** (self.failures - 1)))
+        # 1 fail=5s, 2=10s, 3=20s, 4=40s … cap 300s — much less aggressive
+        self.cooldown_s   = min(300.0, 5.0 * (2 ** (self.failures - 1)))
         logger.warning("Provider %s failed (%d×). Cooldown %.0fs",
                        self.provider.value, self.failures, self.cooldown_s)
 
     def record_success(self):
         self.failures   = 0
-        self.cooldown_s = 60.0
+        self.cooldown_s = 5.0
 
 
 # ── Router ────────────────────────────────────────────────────────────────────
@@ -122,7 +122,6 @@ class LLMRouter:
     def __init__(self, config):
         self._cfg = config
 
-        # Runtime-switchable active models
         self._active: dict[Provider, str] = {
             Provider.GROQ:   config.GROQ_MODEL,
             Provider.GEMINI: config.LLM_MODEL,
@@ -139,17 +138,12 @@ class LLMRouter:
         self._nvidia_client = None
         self._init_clients()
 
-        # Callback fired when provider switches due to rate limit
-        # Set by main.py to send a Telegram notification
-        self.on_switch_cb = None   # async fn(msg: str) | None
-
-        # Last response metadata (read by main.py for badge)
+        self.on_switch_cb               = None
         self.last_meta: ResponseMeta | None = None
 
     # ── Init ──────────────────────────────────────────────────────────────────
 
     def _init_clients(self):
-        # Gemini
         try:
             import google.generativeai as genai
             if self._cfg.LLM_API_KEY:
@@ -159,7 +153,6 @@ class LLMRouter:
         except Exception as exc:
             logger.warning("Gemini init failed: %s", exc)
 
-        # Groq (OpenAI-compatible)
         try:
             if self._cfg.GROQ_API_KEY:
                 import openai
@@ -171,7 +164,6 @@ class LLMRouter:
         except Exception as exc:
             logger.warning("Groq init failed: %s", exc)
 
-        # NVIDIA NIM (OpenAI-compatible)
         try:
             if self._cfg.NVIDIA_API_KEY:
                 import openai
@@ -186,26 +178,24 @@ class LLMRouter:
     # ── Provider chain ────────────────────────────────────────────────────────
 
     def _chain(self) -> list[Provider]:
-        """Build provider chain with PRIMARY_PROVIDER first."""
         primary_name = getattr(self._cfg, "PRIMARY_PROVIDER", "groq").lower()
-        mapping = {p.value: p for p in Provider}
-        primary = mapping.get(primary_name, Provider.GROQ)
-        rest    = [p for p in [Provider.GROQ, Provider.GEMINI, Provider.NVIDIA, Provider.OLLAMA]
-                   if p != primary]
+        mapping      = {p.value: p for p in Provider}
+        primary      = mapping.get(primary_name, Provider.GROQ)
+        rest         = [p for p in [Provider.GROQ, Provider.GEMINI, Provider.NVIDIA, Provider.OLLAMA]
+                        if p != primary]
         return [primary] + rest
 
     # ── Public API ────────────────────────────────────────────────────────────
 
     async def complete(
         self,
-        messages:      list[dict],
-        system_prompt: str,
-        tools:         list[dict] | None = None,
+        messages:         list[dict],
+        system_prompt:    str,
+        tools:            list[dict] | None = None,
         estimated_tokens: int = 0,
     ) -> LLMResponse:
-        """Try providers in priority order until one succeeds."""
-        chain      = self._chain()
-        prev_prov  = None
+        chain     = self._chain()
+        prev_prov = None
 
         for provider in chain:
             h = self._health[provider]
@@ -214,7 +204,6 @@ class LLMRouter:
                 logger.debug("Skipping %s (cooldown)", provider.value)
                 continue
 
-            # Pre-emptive rate limit check
             if h.is_near_limit():
                 logger.info("%s near token limit — skipping", provider.value)
                 if self.on_switch_cb and prev_prov:
@@ -262,11 +251,10 @@ class LLMRouter:
                 logger.warning("%s error: %s", provider.value, exc)
                 h.record_failure()
                 prev_prov = provider.value
-                # Notify on 429 specifically
                 if "429" in str(exc) or "rate" in str(exc).lower():
                     if self.on_switch_cb:
                         await self.on_switch_cb(
-                            f"🚫 `{provider.value}` rate limited (429) — switching provider…"
+                            f"🚫 `{provider.value}` rate limited — switching provider…"
                         )
 
         raise RuntimeError("All LLM providers exhausted. Check API keys and network.")
@@ -283,7 +271,6 @@ class LLMRouter:
     def set_primary(self, provider: str) -> str:
         if provider.lower() not in {p.value for p in Provider}:
             return f"❌ Unknown provider `{provider}`"
-        # Write to config (runtime only — persisting to .env is done by main.py)
         self._cfg.PRIMARY_PROVIDER = provider.lower()
         return f"⭐ `{provider}` set as primary provider"
 
@@ -321,8 +308,8 @@ class LLMRouter:
         if not self._groq_client:
             return []
         try:
-            resp   = await self._groq_client.models.list()
-            skip   = ("whisper", "tts", "embed", "guard")
+            resp = await self._groq_client.models.list()
+            skip = ("whisper", "tts", "embed", "guard")
             return sorted(m.id for m in resp.data if not any(s in m.id for s in skip))
         except Exception as exc:
             logger.warning("fetch_groq_models: %s", exc)
@@ -467,34 +454,30 @@ class LLMRouter:
             resp.raise_for_status()
         return _parse_text(resp.json().get("message", {}).get("content", ""))
 
-    # ── OpenAI-compatible helper (Groq + NVIDIA share this) ──────────────────
+    # ── OpenAI-compatible (Groq + NVIDIA) ─────────────────────────────────────
+    # IMPORTANT: We do NOT use native function-calling/tool_choice here.
+    # Groq returns 400 "tool_use_failed" when the model tries to emit a tool
+    # call for a function not explicitly declared in request_tools — which
+    # happens when the system prompt (ReAct JSON) and native tools conflict.
+    # Solution: inject tool descriptions as plain text (same as Ollama).
+    # Gemini is unaffected since it uses its own function_declarations API.
 
     async def _openai_compat(self, client, model, messages, system_prompt, tools) -> LLMResponse:
-        msgs: list[dict] = [{"role": "system", "content": system_prompt}]
+        sp = system_prompt + (f"\n\n{_tools_to_text(tools)}" if tools else "")
+        msgs: list[dict] = [{"role": "system", "content": sp}]
         for m in messages:
             role    = m.get("role", "user")
             if role == "model": role = "assistant"
             content = (" ".join(m.get("parts", [])) if isinstance(m.get("parts"), list)
                        else m.get("content", ""))
             msgs.append({"role": role, "content": content})
-        kwargs: dict[str, Any] = {"model": model, "messages": msgs}
-        if tools:
-            from agent.tool_schema import openai_tools
-            kwargs["tools"]       = openai_tools()
-            kwargs["tool_choice"] = "auto"
-        response = await client.chat.completions.create(**kwargs)
+        response = await client.chat.completions.create(model=model, messages=msgs)
         choice   = response.choices[0]
-        if choice.message.tool_calls:
-            tc   = choice.message.tool_calls[0]
-            try:   args = json.loads(tc.function.arguments)
-            except json.JSONDecodeError: args = {}
-            return ToolCall(name=tc.function.name, args=args)
         return _parse_text(choice.message.content or "")
 
 
 # ── Shared text helpers ───────────────────────────────────────────────────────
 
-import re as _re
 _JSON_RE = _re.compile(r"```json\s*(\{.*?\})\s*```", _re.DOTALL)
 
 
@@ -503,11 +486,11 @@ def _extract_json(text: str) -> str | None:
     if start == -1: return None
     depth, in_str, escape = 0, False, False
     for i, ch in enumerate(text[start:], start):
-        if escape:           escape = False; continue
-        if ch == "\\" and in_str: escape = True; continue
-        if ch == '"':        in_str = not in_str; continue
-        if in_str:           continue
-        if ch == "{":        depth += 1
+        if escape:                escape = False; continue
+        if ch == "\\" and in_str: escape = True;  continue
+        if ch == '"':             in_str = not in_str; continue
+        if in_str:                continue
+        if ch == "{":             depth += 1
         elif ch == "}":
             depth -= 1
             if depth == 0: return text[start:i + 1]
@@ -519,7 +502,7 @@ def _parse_text(text: str) -> LLMResponse:
     raw = m.group(1) if m else _extract_json(text)
     if raw:
         try:
-            obj = json.loads(raw)
+            obj    = json.loads(raw)
             action = obj.get("action", "")
             if action == "final_answer": return TextResponse(text=obj.get("answer", text))
             if action == "ask_user":     return AskUser(question=obj.get("question", ""))

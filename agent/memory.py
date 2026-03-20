@@ -1,11 +1,18 @@
 """
-agent/memory.py  — V1
+agent/memory.py — Nexara V1
 Persistent memory with semantic vector search.
 
 Storage  : SQLite (facts, tasks, downloads, conversations)
-Search   : sentence-transformers embeddings → cosine similarity
+Search   : sentence-transformers embeddings -> cosine similarity
            (falls back to FTS if transformers not installed)
 Injection: Top-N most relevant memories for current query only.
+
+Fixes applied:
+  - EmbeddingEngine lock: asyncio.Lock serialises encode() calls to prevent
+    concurrent C-extension access causing SIGBUS (bus error / core dump).
+    Lock is initialised at class definition time to avoid TOCTOU race.
+  - SQLite connection leaks: all inline lambda-style connect() calls replaced
+    with proper context managers that guarantee connection.close().
 """
 
 import asyncio
@@ -21,8 +28,8 @@ import numpy as np
 
 logger = logging.getLogger("nexara.memory")
 
-DB_PATH    = Path.home() / ".nexara" / "memory.db"
-EMBED_DIM  = 384   # all-MiniLM-L6-v2 dimension
+DB_PATH   = Path.home() / ".nexara" / "memory.db"
+EMBED_DIM = 384   # all-MiniLM-L6-v2 dimension
 
 
 # ── Embedding engine ──────────────────────────────────────────────────────────
@@ -31,12 +38,20 @@ class EmbeddingEngine:
     """
     Wraps sentence-transformers. Falls back gracefully if not installed.
     Runs all heavy work in a thread pool so it never blocks the event loop.
+
+    TOCTOU fix: _lock is initialised at class-body time (not lazily), so there
+    is never a race between two coroutines both seeing cls._lock is None.
+
+    SIGBUS fix: asyncio.Lock serialises all encode() calls. sentence-transformers'
+    C extension is not safe to call concurrently from multiple threads via
+    asyncio.to_thread — parallel calls caused SIGBUS / core dumps.
     """
-    _model = None
-    _available = None
+    _model:     Any             = None
+    _available: bool | None     = None
+    _lock:      asyncio.Lock    = asyncio.Lock()   # created once at import time
 
     @classmethod
-    def _load(cls):
+    def _load(cls) -> bool:
         if cls._available is not None:
             return cls._available
         try:
@@ -53,35 +68,37 @@ class EmbeddingEngine:
     async def embed(cls, text: str) -> np.ndarray | None:
         if not await asyncio.to_thread(cls._load):
             return None
-        vec = await asyncio.to_thread(cls._model.encode, text, normalize_embeddings=True)
+        async with cls._lock:
+            vec = await asyncio.to_thread(cls._model.encode, text, normalize_embeddings=True)
         return vec.astype(np.float32)
 
     @classmethod
     async def embed_batch(cls, texts: list[str]) -> list[np.ndarray] | None:
         if not await asyncio.to_thread(cls._load):
             return None
-        vecs = await asyncio.to_thread(
-            cls._model.encode, texts, normalize_embeddings=True, show_progress_bar=False
-        )
+        async with cls._lock:
+            vecs = await asyncio.to_thread(
+                cls._model.encode, texts, normalize_embeddings=True, show_progress_bar=False
+            )
         return [v.astype(np.float32) for v in vecs]
 
 
 def _cosine(a: np.ndarray, b: np.ndarray) -> float:
-    return float(np.dot(a, b))          # both already L2-normalised
+    return float(np.dot(a, b))   # both already L2-normalised
 
 
 # ── Data classes ──────────────────────────────────────────────────────────────
 
 @dataclass
 class MemoryEntry:
-    id: int
-    kind: str
-    content: str
-    tags: list[str]
-    metadata: dict
-    timestamp: float
+    id:         int
+    kind:       str
+    content:    str
+    tags:       list[str]
+    metadata:   dict
+    timestamp:  float
     importance: int
-    score: float = 1.0   # relevance score when returned from recall()
+    score:      float = 1.0
 
 
 # ── AgentMemory ───────────────────────────────────────────────────────────────
@@ -150,10 +167,10 @@ class AgentMemory:
 
     async def remember(
         self,
-        content: str,
-        kind: str = "fact",
-        tags: list[str] | None = None,
-        metadata: dict | None = None,
+        content:    str,
+        kind:       str = "fact",
+        tags:       list[str] | None = None,
+        metadata:   dict | None = None,
         importance: int = 3,
     ) -> int:
         tags     = tags or []
@@ -170,7 +187,6 @@ class AgentMemory:
                     (kind, content, json.dumps(tags), json.dumps(metadata), now, importance, blob),
                 )
                 rowid = cur.lastrowid
-                # Update FTS index
                 conn.execute(
                     "INSERT INTO memories_fts(rowid, content) VALUES (?,?)",
                     (rowid, content),
@@ -185,22 +201,16 @@ class AgentMemory:
 
     async def recall(
         self,
-        query: str = "",
-        kind: str | None = None,
-        limit: int = 8,
+        query:          str = "",
+        kind:           str | None = None,
+        limit:          int = 8,
         min_importance: int = 1,
     ) -> list[MemoryEntry]:
-        """
-        Semantic recall: embed query, score all stored embeddings,
-        return top-N by cosine similarity.
-        Falls back to FTS keyword search if embeddings unavailable.
-        """
-        # ── Load all candidate rows ───────────────────────────────────────────
         def _load():
             with sqlite3.connect(self._db) as conn:
                 conn.row_factory = sqlite3.Row
-                clauses = ["importance >= ?"]
-                params: list[Any] = [min_importance]
+                clauses: list[str] = ["importance >= ?"]
+                params:  list[Any] = [min_importance]
                 if kind:
                     clauses.append("kind = ?")
                     params.append(kind)
@@ -224,11 +234,9 @@ class AgentMemory:
             for r in rows
         ]
 
-        # ── Semantic scoring ──────────────────────────────────────────────────
         if query:
             q_vec = await EmbeddingEngine.embed(query)
             if q_vec is not None:
-                scored = []
                 for e, r in zip(entries, rows):
                     blob = r["embedding"]
                     if blob:
@@ -237,10 +245,8 @@ class AgentMemory:
                             e.score = _cosine(q_vec, e_vec) * (e.importance / 5.0)
                         except Exception:
                             pass
-                    scored.append(e)
-                entries = sorted(scored, key=lambda x: x.score, reverse=True)
+                entries = sorted(entries, key=lambda x: x.score, reverse=True)
             else:
-                # FTS fallback
                 def _fts():
                     with sqlite3.connect(self._db) as conn:
                         conn.row_factory = sqlite3.Row
@@ -257,32 +263,30 @@ class AgentMemory:
     # ── Relevance-scored memory injection ─────────────────────────────────────
 
     async def relevant_context(self, query: str, limit: int = 5) -> str:
-        """
-        Returns only the top-N memories most relevant to `query`.
-        Used for LLM system prompt injection.
-        """
         entries = await self.recall(query=query, limit=limit, min_importance=2)
         if not entries:
             return ""
         from datetime import datetime
-        lines = ["📚 Relevant memories:\n"]
+        lines = ["Relevant memories:\n"]
         for e in entries:
             ts = datetime.fromtimestamp(e.timestamp).strftime("%b %d")
-            lines.append(f"• [{e.kind.upper()}] {e.content}  ({ts})")
+            lines.append(f"- [{e.kind.upper()}] {e.content}  ({ts})")
         return "\n".join(lines)
 
     # ── Conversation persistence ───────────────────────────────────────────────
 
     async def save_turn(self, user_id: int, role: str, content: str):
-        await asyncio.to_thread(
-            lambda: sqlite3.connect(self._db).execute(
-                "INSERT INTO conversations (user_id,role,content,timestamp) VALUES (?,?,?,?)",
-                (user_id, role, content, time.time()),
-            ).connection.commit()
-        )
+        """Save one conversation turn. Uses proper context manager — no leaked connections."""
+        now = time.time()
+        def _w():
+            with sqlite3.connect(self._db) as conn:
+                conn.execute(
+                    "INSERT INTO conversations (user_id,role,content,timestamp) VALUES (?,?,?,?)",
+                    (user_id, role, content, now),
+                )
+        await asyncio.to_thread(_w)
 
     async def load_history(self, user_id: int, limit: int = 40) -> list[dict]:
-        """Load the last `limit` turns for a user from SQLite."""
         def _r():
             with sqlite3.connect(self._db) as conn:
                 conn.row_factory = sqlite3.Row
@@ -296,49 +300,54 @@ class AgentMemory:
         return [{"role": r["role"], "parts": [r["content"]]} for r in rows]
 
     async def clear_history(self, user_id: int):
-        await asyncio.to_thread(
-            lambda: sqlite3.connect(self._db).execute(
-                "DELETE FROM conversations WHERE user_id=?", (user_id,)
-            ).connection.commit()
-        )
+        def _w():
+            with sqlite3.connect(self._db) as conn:
+                conn.execute("DELETE FROM conversations WHERE user_id=?", (user_id,))
+        await asyncio.to_thread(_w)
 
     # ── Task log ──────────────────────────────────────────────────────────────
 
     async def log_task(self, goal: str, steps: list[str]) -> int:
+        now = time.time()
         def _w():
             with sqlite3.connect(self._db) as conn:
                 return conn.execute(
                     "INSERT INTO tasks (goal,steps,status,created_at) VALUES (?,?,?,?)",
-                    (goal, json.dumps(steps), "running", time.time()),
+                    (goal, json.dumps(steps), "running", now),
                 ).lastrowid
         return await asyncio.to_thread(_w)
 
     async def complete_task(self, task_id: int, result: str, success: bool = True):
-        await asyncio.to_thread(
-            lambda: sqlite3.connect(self._db).execute(
-                "UPDATE tasks SET status=?,result=?,completed_at=? WHERE id=?",
-                ("done" if success else "failed", result, time.time(), task_id),
-            ).connection.commit()
-        )
+        now = time.time()
+        def _w():
+            with sqlite3.connect(self._db) as conn:
+                conn.execute(
+                    "UPDATE tasks SET status=?,result=?,completed_at=? WHERE id=?",
+                    ("done" if success else "failed", result, now, task_id),
+                )
+        await asyncio.to_thread(_w)
 
     # ── Download log ──────────────────────────────────────────────────────────
 
     async def log_download(self, url: str, filename: str, save_path: str) -> int:
+        now = time.time()
         def _w():
             with sqlite3.connect(self._db) as conn:
                 return conn.execute(
                     "INSERT INTO downloads (url,filename,save_path,status,started_at) VALUES (?,?,?,?,?)",
-                    (url, filename, save_path, "running", time.time()),
+                    (url, filename, save_path, "running", now),
                 ).lastrowid
         return await asyncio.to_thread(_w)
 
     async def update_download(self, dl_id: int, status: str, size_bytes: int = 0, error: str = ""):
-        await asyncio.to_thread(
-            lambda: sqlite3.connect(self._db).execute(
-                "UPDATE downloads SET status=?,size_bytes=?,error=?,completed_at=? WHERE id=?",
-                (status, size_bytes, error, time.time(), dl_id),
-            ).connection.commit()
-        )
+        now = time.time()
+        def _w():
+            with sqlite3.connect(self._db) as conn:
+                conn.execute(
+                    "UPDATE downloads SET status=?,size_bytes=?,error=?,completed_at=? WHERE id=?",
+                    (status, size_bytes, error, now, dl_id),
+                )
+        await asyncio.to_thread(_w)
 
     async def download_history(self, limit: int = 10) -> str:
         def _r():
@@ -358,17 +367,17 @@ class AgentMemory:
             lines.append(f"{ico} `{r['filename'] or r['url'][:40]}` — {r['status']} ({sz})")
         return "\n".join(lines)
 
-    # ── Memory skill wrappers (called by agent via skill router) ──────────────
+    # ── Memory skill wrappers ─────────────────────────────────────────────────
 
     async def skill_remember(self, content: str, kind: str = "fact", importance: int = 3, **_) -> str:
         mid = await self.remember(content, kind=kind, importance=importance)
-        return f"✅ Stored memory #{mid}"
+        return f"Stored memory #{mid}"
 
     async def skill_recall(self, query: str, kind: str | None = None, **_) -> str:
         entries = await self.recall(query=query, kind=kind, limit=6)
         if not entries:
             return "No relevant memories found."
-        lines = [f"🧠 **Memory Recall** for _'{query}'_\n"]
+        lines = [f"Memory Recall for '{query}'\n"]
         for e in entries:
-            lines.append(f"• [{e.kind}] {e.content}  (score: {e.score:.2f})")
+            lines.append(f"- [{e.kind}] {e.content}  (score: {e.score:.2f})")
         return "\n".join(lines)

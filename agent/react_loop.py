@@ -1,12 +1,14 @@
 """
-agent/react_loop.py  — V1
+agent/react_loop.py — Nexara V1
 ReAct engine using structured function-calling.
-New in V1:
   • Uses LLMRouter instead of raw genai calls
   • Structured ToolCall responses (no regex parsing)
   • Replanning: detects skill failures and asks LLM for alternatives
   • Per-user concurrency semaphore (fairness)
   • Step streaming: status_cb fires on THINK too, not just ACT
+  • JSON retry: malformed LLM responses get one correction prompt
+  • Per-step LLM timeout (30s) + skill execution timeout (60s)
+  • Plain-text status updates — no Markdown in status_cb (prevents Telegram crashes)
 """
 
 import asyncio
@@ -19,37 +21,41 @@ from agent.llm_router import LLMRouter, LLMResponse, ToolCall, TextResponse, Ask
 
 logger = logging.getLogger("nexara.react")
 
-MAX_ITERATIONS    = 14
-MAX_REPLAN_DEPTH  = 3    # how many times we'll try an alternative on failure
+MAX_ITERATIONS   = 14
+MAX_REPLAN_DEPTH = 3
+STEP_LLM_TIMEOUT = 45   # seconds — per LLM call inside the loop
+SKILL_TIMEOUT    = 60   # seconds — per skill execution
+JSON_RETRY_LIMIT = 2    # retry malformed JSON this many times before giving up
+
 _USER_SEMS: dict[int, asyncio.Semaphore] = defaultdict(lambda: asyncio.Semaphore(2))
 
 
 @dataclass
 class Step:
-    iteration: int
-    thought: str
-    action: str
-    args: dict
+    iteration:   int
+    thought:     str
+    action:      str
+    args:        dict
     observation: str
-    success: bool
-    replanned: bool = False
+    success:     bool
+    replanned:   bool = False
 
 
 @dataclass
 class AgentResult:
-    answer: str
-    steps: list[Step]          = field(default_factory=list)
-    used_skills: list[str]     = field(default_factory=list)
-    iterations: int            = 0
-    needs_user_input: bool     = False
-    question_for_user: str     = ""
+    answer:            str
+    steps:             list[Step] = field(default_factory=list)
+    used_skills:       list[str]  = field(default_factory=list)
+    iterations:        int        = 0
+    needs_user_input:  bool       = False
+    question_for_user: str        = ""
 
 
 class ReactLoop:
 
     def __init__(
         self,
-        router: LLMRouter,
+        router:     LLMRouter,
         skill_exec: Callable[[str, dict], Awaitable[Any]],
     ):
         self._router = router
@@ -57,44 +63,90 @@ class ReactLoop:
 
     async def run(
         self,
-        goal: str,
-        history: list[dict],
+        goal:          str,
+        history:       list[dict],
         system_prompt: str,
-        tools: list[dict] | None = None,
-        user_id: int = 0,
-        status_cb: Callable[[str], Awaitable[None]] | None = None,
+        tools:         list[dict] | None = None,
+        user_id:       int = 0,
+        status_cb:     Callable[[str], Awaitable[None]] | None = None,
     ) -> AgentResult:
-        """
-        Acquire per-user semaphore → run ReAct loop → release.
-        """
         sem = _USER_SEMS[user_id]
         async with sem:
             return await self._run_inner(goal, history, system_prompt, tools, status_cb)
 
+    # ── Safe status helper ────────────────────────────────────────────────────
+    # Plain text only — Telegram's Markdown v1 parser crashes on skill names
+    # that contain underscores (e.g. web_search, system_info).
+
+    @staticmethod
+    async def _status(cb, msg: str):
+        if cb:
+            try:
+                await cb(msg)
+            except Exception:
+                pass
+
+    # ── Core loop ─────────────────────────────────────────────────────────────
+
     async def _run_inner(self, goal, history, system_prompt, tools, status_cb) -> AgentResult:
-        steps:       list[Step] = []
-        used_skills: list[str]  = []
-        replan_budget            = MAX_REPLAN_DEPTH
+        steps:         list[Step] = []
+        used_skills:   list[str]  = []
+        replan_budget              = MAX_REPLAN_DEPTH
+        json_retries               = 0
 
         messages = list(history)
         messages.append({"role": "user", "parts": [goal]})
 
         for i in range(1, MAX_ITERATIONS + 1):
+
             # ── THINK ────────────────────────────────────────────────────────
-            if status_cb:
-                await status_cb(f"🧠 Thinking… _(step {i})_")
+            await self._status(status_cb, f"Thinking... (step {i})")
 
-            response: LLMResponse = await self._router.complete(
-                messages=messages,
-                system_prompt=system_prompt,
-                tools=tools,
-            )
-
-            # ── TERMINAL: text answer ─────────────────────────────────────────
-            if isinstance(response, TextResponse):
-                steps.append(Step(i, response.text, "final_answer", {}, "", True))
+            try:
+                response: LLMResponse = await asyncio.wait_for(
+                    self._router.complete(
+                        messages=messages,
+                        system_prompt=system_prompt,
+                        tools=tools,
+                    ),
+                    timeout=STEP_LLM_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                logger.warning("LLM timed out on step %d", i)
+                # Try to get a final answer from whatever context we have
+                await self._status(status_cb, "LLM timed out — wrapping up...")
+                break
+            except Exception as exc:
+                logger.error("LLM error on step %d: %s", i, exc)
+                await self._status(status_cb, f"LLM error: {exc}")
                 return AgentResult(
-                    answer=response.text,
+                    answer=f"I ran into an error communicating with the AI: {exc}",
+                    steps=steps, used_skills=used_skills, iterations=i,
+                )
+
+            # ── TERMINAL: plain text answer ───────────────────────────────────
+            if isinstance(response, TextResponse):
+                # Sanity check: if the text looks like a broken JSON attempt,
+                # give the model one correction prompt before accepting it.
+                raw = response.text
+                if (json_retries < JSON_RETRY_LIMIT
+                        and raw.strip().startswith("{")
+                        and '"action"' not in raw):
+                    json_retries += 1
+                    messages.append({
+                        "role": "user",
+                        "parts": [
+                            f"Your response was not valid ReAct JSON: {raw[:200]}\n"
+                            "Please emit a single valid JSON block using the format shown in the system prompt. "
+                            'Use {"action":"final_answer","answer":"..."} if you are done.'
+                        ],
+                    })
+                    await self._status(status_cb, f"Retrying malformed JSON (attempt {json_retries})...")
+                    continue
+
+                steps.append(Step(i, raw, "final_answer", {}, "", True))
+                return AgentResult(
+                    answer=raw,
                     steps=steps,
                     used_skills=used_skills,
                     iterations=i,
@@ -113,56 +165,80 @@ class ReactLoop:
 
             # ── ACT ──────────────────────────────────────────────────────────
             tc: ToolCall = response
-            if status_cb:
-                thought_preview = tc.thought[:60] + "…" if tc.thought else ""
-                await status_cb(
-                    f"⚙️ `{tc.name}` — {thought_preview}" if thought_preview else f"⚙️ `{tc.name}`"
-                )
+            json_retries = 0   # reset on successful tool call parse
+
+            preview = (tc.thought[:60] + "…") if tc.thought else ""
+            if preview:
+                await self._status(status_cb, f"Using {tc.name} — {preview}")
+            else:
+                await self._status(status_cb, f"Using {tc.name}...")
 
             try:
-                result  = await self._exec(tc.name, tc.args)
-                obs     = str(result)
-                ok      = getattr(result, "success", True)
+                result = await asyncio.wait_for(
+                    self._exec(tc.name, tc.args),
+                    timeout=SKILL_TIMEOUT,
+                )
+                obs = str(result)
+                ok  = getattr(result, "success", True)
+            except asyncio.TimeoutError:
+                obs = f"[Skill {tc.name} timed out after {SKILL_TIMEOUT}s]"
+                ok  = False
+                logger.warning("Skill '%s' timed out", tc.name)
             except Exception as exc:
                 obs = f"[Fatal error in {tc.name}: {exc}]"
                 ok  = False
+                logger.error("Skill '%s' raised: %s", tc.name, exc)
 
             used_skills.append(tc.name)
             step = Step(i, tc.thought, tc.name, tc.args, obs, ok)
             steps.append(step)
 
+            logger.info("Step %d/%d: %s -> ok=%s | %s",
+                        i, MAX_ITERATIONS, tc.name, ok, obs[:80])
+
             # ── REPLAN on failure ─────────────────────────────────────────────
             if not ok and replan_budget > 0:
                 replan_budget -= 1
-                replan_msg = (
-                    f"The skill `{tc.name}` failed with: {obs}\n"
-                    f"Think of an alternative approach. Replanning budget: {replan_budget} attempt(s) left."
-                )
-                messages.append({"role": "user", "parts": [replan_msg]})
                 step.replanned = True
-                if status_cb:
-                    await status_cb(f"🔁 Replanning after `{tc.name}` failure…")
-                continue   # skip normal observe-append, go straight to next THINK
+                messages.append({
+                    "role": "user",
+                    "parts": [
+                        f"The skill '{tc.name}' failed: {obs}\n"
+                        f"Think of an alternative approach. "
+                        f"Replanning budget remaining: {replan_budget}."
+                    ],
+                })
+                await self._status(status_cb, f"Replanning after {tc.name} failed...")
+                continue
 
             # ── OBSERVE ───────────────────────────────────────────────────────
             messages.append({
                 "role": "user",
                 "parts": [
-                    f"[Observation from `{tc.name}`]:\n{obs}\n\n"
-                    "Continue with the next step or emit a final_answer if the task is complete."
+                    f"[Observation from '{tc.name}']:\n{obs}\n\n"
+                    "Continue with the next step, or emit a final_answer if the task is complete."
                 ],
             })
 
-            logger.info("Step %d/%d: %s → ok=%s | %s", i, MAX_ITERATIONS, tc.name, ok, obs[:80])
-
-        # Max iterations — force final answer
+        # ── Max iterations hit — force final answer ───────────────────────────
+        await self._status(status_cb, "Summarising results...")
         messages.append({
             "role": "user",
-            "parts": ["Maximum steps reached. Summarise everything you've found as a final answer."],
+            "parts": ["Maximum steps reached. Summarise everything you've found as a final_answer now."],
         })
-        response = await self._router.complete(messages, system_prompt, tools)
-        answer = response.text if isinstance(response, TextResponse) else \
-                 (response.answer if hasattr(response, "answer") else str(response))
+        try:
+            response = await asyncio.wait_for(
+                self._router.complete(messages, system_prompt, tools),
+                timeout=STEP_LLM_TIMEOUT,
+            )
+            if isinstance(response, TextResponse):
+                answer = response.text
+            elif isinstance(response, ToolCall):
+                answer = f"Completed {len(steps)} steps. Last action: {steps[-1].action if steps else 'none'}."
+            else:
+                answer = str(response)
+        except Exception as exc:
+            answer = f"Completed {len(steps)} steps but failed to summarise: {exc}"
 
         return AgentResult(
             answer=answer.strip(),
