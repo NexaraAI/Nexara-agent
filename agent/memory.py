@@ -4,21 +4,31 @@ Persistent memory with semantic vector search.
 
 Storage  : SQLite (facts, tasks, downloads, conversations)
 Search   : sentence-transformers embeddings -> cosine similarity
-           (falls back to FTS if transformers not installed)
+           (falls back to FTS on overlayfs / Codespaces / Docker)
 Injection: Top-N most relevant memories for current query only.
 
-Fixes applied:
-  - EmbeddingEngine lock: asyncio.Lock serialises encode() calls to prevent
-    concurrent C-extension access causing SIGBUS (bus error / core dump).
-    Lock is initialised at class definition time to avoid TOCTOU race.
-  - SQLite connection leaks: all inline lambda-style connect() calls replaced
-    with proper context managers that guarantee connection.close().
+SIGBUS root cause & fix:
+  PyTorch lazily mmap-loads model weights. On overlayfs (Codespaces, Docker
+  overlay2) the kernel cannot back those mmap pages and raises SIGBUS on first
+  access — usually inside _memory.remember() after a skill run completes.
+  SIGBUS is signal 7 — it terminates the process, it cannot be caught by
+  try/except.
+
+  Fix: _overlayfs_environment() uses THREE independent detection methods:
+    1. Env vars  — CODESPACES, GITHUB_CODESPACE_TOKEN (fastest)
+    2. /.dockerenv — Docker overlay2
+    3. /proc/mounts — looks for 'overlay' filesystem type (catches edge cases
+       where env vars are absent but overlayfs is still in use)
+  If ANY method fires, sentence-transformers is never imported and the FTS
+  keyword fallback is used instead. No mmap, no SIGBUS.
 """
 
 import asyncio
 import json
 import logging
+import os
 import sqlite3
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -29,38 +39,99 @@ import numpy as np
 logger = logging.getLogger("nexara.memory")
 
 DB_PATH   = Path.home() / ".nexara" / "memory.db"
-EMBED_DIM = 384   # all-MiniLM-L6-v2 dimension
+EMBED_DIM = 384
+
+# Prevent tokenizer fork warnings
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+# Hint to PyTorch not to use CUDA memory caching (extra safety on VMs)
+os.environ.setdefault("PYTORCH_NO_CUDA_MEMORY_CACHING", "1")
+
+
+# ── Overlayfs detection — three independent methods ───────────────────────────
+
+def _overlayfs_environment() -> bool:
+    """
+    Returns True if the process is running on a filesystem where PyTorch
+    mmap of weight files would cause SIGBUS.
+
+    Method 1 — environment variables (fastest, set by Codespaces/CI):
+    """
+    if (os.getenv("CODESPACES") == "true"
+            or os.getenv("GITHUB_CODESPACE_TOKEN")
+            or os.getenv("GITHUB_ACTIONS") == "true"):
+        return True
+
+    # Method 2 — Docker sentinel file
+    if Path("/.dockerenv").exists():
+        return True
+
+    # Method 3 — /proc/mounts overlay filesystem type
+    # This catches cases where env vars are not set but overlayfs is active,
+    # e.g. nested containers, custom Codespace images, or Gitpod workspaces.
+    try:
+        mounts = Path("/proc/mounts").read_text()
+        for line in mounts.splitlines():
+            parts = line.split()
+            if len(parts) >= 3 and parts[2] in ("overlay", "overlayfs"):
+                return True
+    except Exception:
+        pass
+
+    # Method 4 — WSL has its own mmap quirks
+    try:
+        if "microsoft" in Path("/proc/version").read_text().lower():
+            return True
+    except Exception:
+        pass
+
+    return False
+
+
+_EMBEDDINGS_DISABLED = _overlayfs_environment()
+if _EMBEDDINGS_DISABLED:
+    logger.info(
+        "sentence-transformers DISABLED — overlayfs/Codespaces/Docker detected. "
+        "Using FTS keyword fallback (stable, no mmap, no SIGBUS)."
+    )
 
 
 # ── Embedding engine ──────────────────────────────────────────────────────────
 
 class EmbeddingEngine:
     """
-    Wraps sentence-transformers. Falls back gracefully if not installed.
-    Runs all heavy work in a thread pool so it never blocks the event loop.
+    Wraps sentence-transformers with platform-aware safe fallback.
 
-    TOCTOU fix: _lock is initialised at class-body time (not lazily), so there
-    is never a race between two coroutines both seeing cls._lock is None.
+    On overlayfs platforms: _load() returns False immediately — PyTorch is
+    never imported, no mmap, no SIGBUS possible.
 
-    SIGBUS fix: asyncio.Lock serialises all encode() calls. sentence-transformers'
-    C extension is not safe to call concurrently from multiple threads via
-    asyncio.to_thread — parallel calls caused SIGBUS / core dumps.
+    On safe platforms (native Linux, macOS, Windows):
+      - asyncio.Lock prevents concurrent coroutine encode() calls
+      - threading.Lock prevents any residual thread-pool races
     """
-    _model:     Any             = None
-    _available: bool | None     = None
-    _lock:      asyncio.Lock    = asyncio.Lock()   # created once at import time
+    _model:    Any            = None
+    _available: bool | None   = None
+    _aio_lock: asyncio.Lock   = asyncio.Lock()
+    _thr_lock: threading.Lock = threading.Lock()
 
     @classmethod
     def _load(cls) -> bool:
+        if _EMBEDDINGS_DISABLED:
+            cls._available = False
+            return False
+
         if cls._available is not None:
             return cls._available
+
         try:
             from sentence_transformers import SentenceTransformer
-            cls._model     = SentenceTransformer("all-MiniLM-L6-v2")
+            cls._model     = SentenceTransformer(
+                "all-MiniLM-L6-v2",
+                device="cpu",   # explicit cpu avoids CUDA mmap paths
+            )
             cls._available = True
-            logger.info("Sentence-transformers loaded (semantic search enabled)")
+            logger.info("sentence-transformers loaded (semantic search enabled)")
         except Exception as exc:
-            logger.warning("sentence-transformers unavailable (%s) — using FTS fallback", exc)
+            logger.warning("sentence-transformers unavailable: %s — FTS fallback", exc)
             cls._available = False
         return cls._available
 
@@ -68,23 +139,40 @@ class EmbeddingEngine:
     async def embed(cls, text: str) -> np.ndarray | None:
         if not await asyncio.to_thread(cls._load):
             return None
-        async with cls._lock:
-            vec = await asyncio.to_thread(cls._model.encode, text, normalize_embeddings=True)
-        return vec.astype(np.float32)
+        try:
+            async with cls._aio_lock:
+                def _enc():
+                    with cls._thr_lock:
+                        return cls._model.encode(text, normalize_embeddings=True)
+                vec = await asyncio.to_thread(_enc)
+            return vec.astype(np.float32)
+        except Exception as exc:
+            logger.error("embed() failed: %s — falling back to FTS", exc)
+            # Disable permanently so we don't keep failing
+            cls._available = False
+            return None
 
     @classmethod
     async def embed_batch(cls, texts: list[str]) -> list[np.ndarray] | None:
         if not await asyncio.to_thread(cls._load):
             return None
-        async with cls._lock:
-            vecs = await asyncio.to_thread(
-                cls._model.encode, texts, normalize_embeddings=True, show_progress_bar=False
-            )
-        return [v.astype(np.float32) for v in vecs]
+        try:
+            async with cls._aio_lock:
+                def _enc():
+                    with cls._thr_lock:
+                        return cls._model.encode(
+                            texts, normalize_embeddings=True, show_progress_bar=False
+                        )
+                vecs = await asyncio.to_thread(_enc)
+            return [v.astype(np.float32) for v in vecs]
+        except Exception as exc:
+            logger.error("embed_batch() failed: %s — falling back to FTS", exc)
+            cls._available = False
+            return None
 
 
 def _cosine(a: np.ndarray, b: np.ndarray) -> float:
-    return float(np.dot(a, b))   # both already L2-normalised
+    return float(np.dot(a, b))
 
 
 # ── Data classes ──────────────────────────────────────────────────────────────
@@ -109,8 +197,6 @@ class AgentMemory:
         self._db = str(db_path)
         db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_db()
-
-    # ── Schema ────────────────────────────────────────────────────────────────
 
     def _init_db(self):
         with sqlite3.connect(self._db) as conn:
@@ -241,7 +327,7 @@ class AgentMemory:
                     blob = r["embedding"]
                     if blob:
                         try:
-                            e_vec  = np.frombuffer(blob, dtype=np.float32)
+                            e_vec   = np.frombuffer(blob, dtype=np.float32).copy()
                             e.score = _cosine(q_vec, e_vec) * (e.importance / 5.0)
                         except Exception:
                             pass
@@ -250,17 +336,21 @@ class AgentMemory:
                 def _fts():
                     with sqlite3.connect(self._db) as conn:
                         conn.row_factory = sqlite3.Row
-                        return conn.execute(
-                            "SELECT rowid FROM memories_fts WHERE memories_fts MATCH ? LIMIT ?",
-                            (query, limit * 2),
-                        ).fetchall()
+                        safe_q = " ".join(
+                            w for w in query.split() if w.isalnum() or len(w) > 2
+                        ) or query
+                        try:
+                            return conn.execute(
+                                "SELECT rowid FROM memories_fts WHERE memories_fts MATCH ? LIMIT ?",
+                                (safe_q, limit * 2),
+                            ).fetchall()
+                        except Exception:
+                            return []
                 fts_rows = await asyncio.to_thread(_fts)
                 fts_ids  = {r["rowid"] for r in fts_rows}
                 entries  = [e for e in entries if e.id in fts_ids] or entries
 
         return entries[:limit]
-
-    # ── Relevance-scored memory injection ─────────────────────────────────────
 
     async def relevant_context(self, query: str, limit: int = 5) -> str:
         entries = await self.recall(query=query, limit=limit, min_importance=2)
@@ -276,7 +366,6 @@ class AgentMemory:
     # ── Conversation persistence ───────────────────────────────────────────────
 
     async def save_turn(self, user_id: int, role: str, content: str):
-        """Save one conversation turn. Uses proper context manager — no leaked connections."""
         now = time.time()
         def _w():
             with sqlite3.connect(self._db) as conn:
@@ -360,11 +449,11 @@ class AgentMemory:
         if not rows:
             return "No downloads recorded."
         icon_map = {"done": "✅", "running": "⏳", "failed": "❌", "queued": "🕐"}
-        lines = ["📥 **Download History**\n"]
+        lines = ["📥 Download History\n"]
         for r in rows:
             sz  = f"{r['size_bytes']/1_048_576:.1f} MB" if r["size_bytes"] else "?"
             ico = icon_map.get(r["status"], "•")
-            lines.append(f"{ico} `{r['filename'] or r['url'][:40]}` — {r['status']} ({sz})")
+            lines.append(f"{ico} {r['filename'] or r['url'][:40]} — {r['status']} ({sz})")
         return "\n".join(lines)
 
     # ── Memory skill wrappers ─────────────────────────────────────────────────
@@ -377,7 +466,8 @@ class AgentMemory:
         entries = await self.recall(query=query, kind=kind, limit=6)
         if not entries:
             return "No relevant memories found."
-        lines = [f"Memory Recall for '{query}'\n"]
+        mode  = "FTS" if _EMBEDDINGS_DISABLED else "semantic"
+        lines = [f"Memory Recall ({mode}) for '{query}'\n"]
         for e in entries:
             lines.append(f"- [{e.kind}] {e.content}  (score: {e.score:.2f})")
         return "\n".join(lines)

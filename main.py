@@ -2,24 +2,25 @@
 main.py — Nexara V1
 Autonomous AI agent with:
   • Multi-platform support (Android · Linux · Codespace · WSL · macOS · Windows)
-  • Platform-filtered skill loading (only relevant skills loaded + sent to LLM)
+  • Platform-filtered skill loading
   • 4-provider LLM router: Groq → Gemini → NVIDIA NIM → Ollama
   • Configurable primary provider (PRIMARY_PROVIDER in .env)
   • Proactive rate-limit switching with user notification
-  • Dynamic token budget (no more 429s from bloated context)
+  • Dynamic token budget
   • Intent classifier (chat mode vs full agent mode)
   • Response badge showing provider · model · latency · tokens
-  • /status command — full live system snapshot
-  • /switchmodel panel with Set as Primary + NVIDIA support
-  • ReAct loop with replanning on failure
+  • /status — full live system snapshot
+  • /switchmodel — paginated, callback_data-safe (64-byte limit handled)
+  • ReAct loop with replanning on failure + JSON retry
   • Semantic long-term memory (SQLite + sentence-transformers)
   • Natural language task scheduler + proactive monitors
-  • Per-user message rate limiting (spam protection)
+  • Per-user message rate limiting
   • Created by DemonZ Development
 """
 
 import asyncio
 import collections
+import hashlib
 import html as _html
 import logging
 import re
@@ -85,22 +86,15 @@ _PROMPT_CACHE: str        = ""
 CREATOR                   = "DemonZ Development"
 
 # ── Per-user rate limiter ─────────────────────────────────────────────────────
-# Allows RATE_LIMIT_MSGS messages per RATE_LIMIT_WINDOW seconds per user.
-# Prevents a single user from burning through all LLM quota with spam.
-RATE_LIMIT_MSGS   = 12   # messages
-RATE_LIMIT_WINDOW = 60   # seconds
-
-# user_id -> deque of timestamps of recent messages
+RATE_LIMIT_MSGS   = 12
+RATE_LIMIT_WINDOW = 60
 _user_rate: dict[int, collections.deque] = collections.defaultdict(
     lambda: collections.deque(maxlen=RATE_LIMIT_MSGS)
 )
 
-
 def _is_rate_limited(uid: int) -> bool:
-    """Returns True if the user has exceeded the rate limit."""
     now    = time.time()
     bucket = _user_rate[uid]
-    # Prune timestamps older than the window
     while bucket and now - bucket[0] > RATE_LIMIT_WINDOW:
         bucket.popleft()
     if len(bucket) >= RATE_LIMIT_MSGS:
@@ -108,32 +102,34 @@ def _is_rate_limited(uid: int) -> bool:
     bucket.append(now)
     return False
 
+# ── Switchmodel model registry (callback_data safety) ────────────────────────
+_model_registry: dict[str, str] = {}
+MAX_MODELS_PER_PROVIDER = 24
+
+def _model_key(provider: str, model: str) -> str:
+    key = hashlib.md5(f"{provider}:{model}".encode()).hexdigest()[:8]
+    _model_registry[key] = model
+    return key
+
+def _model_from_key(key: str) -> str | None:
+    return _model_registry.get(key)
+
 
 # ── Markdown → HTML ───────────────────────────────────────────────────────────
-# Telegram's Markdown v1 parser crashes on **bold** (v2 syntax), on skill
-# names with underscores treated as italic markers, and on unclosed backticks.
-# HTML mode is reliable for all content.
-
 def _md_to_html(text: str) -> str:
-    """Convert basic Markdown formatting to Telegram-safe HTML."""
     text = _html.escape(text)
-    # Fenced code blocks
     text = re.sub(
         r"```(?:\w+\n)?(.*?)```",
         lambda m: f"<pre>{m.group(1).strip()}</pre>",
         text, flags=re.DOTALL,
     )
-    # Inline code
     text = re.sub(r"`([^`\n]+)`", r"<code>\1</code>", text)
-    # Bold **text**
     text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text, flags=re.DOTALL)
-    # Italic _text_ — word-boundary only, preserves snake_case
     text = re.sub(r"(?<!\w)_([^_\n]+)_(?!\w)", r"<i>\1</i>", text)
     return text
 
 
 # ── System prompt ─────────────────────────────────────────────────────────────
-
 def build_system_prompt(force: bool = False) -> str:
     global _PROMPT_CACHE
     if _PROMPT_CACHE and not force:
@@ -190,26 +186,43 @@ Emit exactly one JSON block per step.
 
 
 # ── Intent classifier ─────────────────────────────────────────────────────────
-
+#
+# PURE chat words — only messages that are exclusively these words go to chat
+# (greetings, reactions, affirmations). Everything else defaults to agent.
 _CHAT_WORDS = {
     "hey", "hi", "hello", "sup", "yo", "ok", "okay", "thanks",
     "thank you", "lol", "haha", "nice", "cool", "great", "yes",
     "no", "nope", "yep", "sure", "alright", "bye", "good", "awesome",
     "bruh", "bro", "nah", "yup", "ah", "oh", "wow", "damn", "dang",
     "wth", "wtf", "omg", "lmao", "lmfao", "ikr", "idk", "ugh",
-    "sweet", "perfect", "noted", "k", "kk", "hmm", "hm", "interesting",
-    "really", "seriously", "what", "nice one", "got it",
+    "sweet", "perfect", "noted", "k", "kk", "hmm", "hm",
+    "got it", "nice one",
 }
 
+# Action words — any message containing one of these → agent mode immediately
 _ACTION_WORDS = {
+    # original set
     "download", "search", "find", "look", "run", "execute", "write",
     "create", "make", "build", "delete", "remove", "send", "get",
     "fetch", "check", "scan", "read", "open", "install", "schedule",
     "remind", "take", "capture", "list", "show", "analyse", "analyze",
     "summarize", "translate", "convert", "calculate", "monitor", "watch",
     "play", "stop", "start", "restart", "update", "fix", "debug",
+    # missing words that caused "test my internet speed" to go to chat mode
+    "test", "ping", "measure", "benchmark", "time", "profile",
+    "generate", "produce", "deploy", "publish", "push", "pull",
+    "compress", "extract", "zip", "unzip", "backup", "restore",
+    "enable", "disable", "configure", "setup", "set", "get",
+    "tell", "explain", "describe", "summarise", "research", "look up",
+    "give", "provide", "report", "display", "print", "output",
+    "copy", "move", "rename", "resize", "convert", "encode", "decode",
+    "encrypt", "decrypt", "sign", "verify", "validate",
+    "connect", "disconnect", "scan", "probe", "trace", "route",
+    "help", "do", "can", "could", "would", "please",
+    "what", "how", "why", "when", "where",
 }
 
+# Phrases that always → chat (identity questions)
 _IDENTITY_PHRASES = {
     "who made you", "who created you", "who built you", "who developed you",
     "who are you", "what are you", "tell me about yourself",
@@ -221,37 +234,54 @@ _IDENTITY_PHRASES = {
 
 
 def classify_intent(text: str) -> str:
+    """
+    Returns 'chat' for pure greetings/reactions, 'agent' for everything else.
+
+    Logic change from previous version:
+    - Default is now 'agent' — if ambiguous, use skills (safer than refusing)
+    - Short message threshold lowered to 12 chars (truly only bare greetings)
+    - _ACTION_WORDS massively expanded so action requests are caught reliably
+    - 'what', 'how', 'why', 'can you' etc now trigger agent mode so questions
+      about the real world (e.g. "what's the weather") use web_search
+    """
     clean = text.lower().strip().rstrip("!?.")
 
-    # Identity questions → chat with correct "DemonZ Development" answer
+    # Identity questions → chat with correct DemonZ Development answer
     if any(phrase in clean for phrase in _IDENTITY_PHRASES):
         return "chat"
 
-    if len(text) <= 25:
+    # Very short messages (≤ 12 chars) that are ONLY chat words → chat
+    # "hi", "ok", "lol", "bruh", "k" etc. Must be ONLY chat words.
+    if len(text) <= 12:
         words = set(re.findall(r'\b\w+\b', clean))
-        if words & _CHAT_WORDS and not (words & _ACTION_WORDS):
+        if words and words <= _CHAT_WORDS:   # subset check — ALL words must be chat words
             return "chat"
+        # If even one word isn't a pure chat word, fall through to agent
 
+    # URL → agent always
     if re.search(r'https?://', text):
         return "agent"
 
+    # Any action word → agent
     words = set(re.findall(r'\b\w+\b', clean))
     if words & _ACTION_WORDS:
         return "agent"
 
-    if len(text) > 60:
+    # Any message longer than 20 chars that isn't purely chat words → agent
+    # This catches things like "Test my speed", "Who won yesterday",
+    # "What is Python", "Can you check disk space" etc.
+    if len(text) > 20:
         return "agent"
 
-    return "chat"
+    # Default: agent — it's safer to try skills and say "I don't know"
+    # than to route to a chat LLM that claims it can't do anything
+    return "agent"
 
 
 # ── Telegram helpers ──────────────────────────────────────────────────────────
-
 MAX_MSG = 4000
 
-
 async def send_long(message, text: str):
-    """Send text using HTML parse mode. Falls back to plain text on error."""
     if len(text) <= MAX_MSG:
         try:
             await message.reply_text(_md_to_html(text), parse_mode="HTML")
@@ -265,7 +295,6 @@ async def send_long(message, text: str):
             await message.reply_text(chunk)
         await asyncio.sleep(0.1)
 
-
 async def telegram_alert(text: str):
     if _bot_app and config.ADMIN_ID:
         try:
@@ -276,7 +305,6 @@ async def telegram_alert(text: str):
             )
         except Exception as exc:
             logger.error("Alert failed: %s", exc)
-
 
 async def auto_send_file(message, path_str: str):
     p = Path(path_str)
@@ -297,7 +325,6 @@ async def auto_send_file(message, path_str: str):
     except Exception as exc:
         logger.warning("Auto-send failed for %s: %s", path_str, exc)
 
-
 FILE_PATH_RE = re.compile(
     r"`(/[^\s`]+\.(jpg|jpeg|png|gif|webp|mp4|mp3|m4a|pdf|zip|apk|py|txt|csv|json|tar|gz))`",
     re.IGNORECASE,
@@ -305,17 +332,15 @@ FILE_PATH_RE = re.compile(
 
 
 # ── Core message handler ──────────────────────────────────────────────────────
-
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid  = update.effective_user.id
     text = (update.message.text or "").strip()
     if not text:
         return
 
-    # ── Rate limit check ──────────────────────────────────────────────────────
     if _is_rate_limited(uid):
         await update.message.reply_text(
-            f"⏳ Slow down — max {RATE_LIMIT_MSGS} messages per {RATE_LIMIT_WINDOW}s. Try again shortly."
+            f"⏳ Slow down — max {RATE_LIMIT_MSGS} messages per {RATE_LIMIT_WINDOW}s."
         )
         return
 
@@ -323,13 +348,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_id=update.effective_chat.id, action=ChatAction.TYPING
     )
 
-    mode = classify_intent(text)
-
+    mode        = classify_intent(text)
     raw_history = await _memory.load_history(uid, limit=config.MAX_HISTORY_TURNS)
-
-    sp       = build_system_prompt()
-    budgeted = budget_mod.apply(text, raw_history, sp)
-    history  = budgeted.trimmed_history
+    sp          = build_system_prompt()
+    budgeted    = budget_mod.apply(text, raw_history, sp)
+    history     = budgeted.trimmed_history
 
     mem_ctx = ""
     if budgeted.memory_slots > 0:
@@ -337,7 +360,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if mem_ctx:
         sp = sp + f"\n\n{mem_ctx}"
 
-    # Plain text spinner — no parse_mode, avoids Markdown crashes on skill names
+    # Plain-text spinner — no parse_mode (skill names contain underscores)
     status_msg = await update.message.reply_text("🧠 Thinking…")
 
     async def status_cb(msg: str):
@@ -351,17 +374,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if mode == "chat":
         messages = list(history[-6:])
         messages.append({"role": "user", "parts": [text]})
+        # FIX: Chat system prompt now explicitly tells the LLM what Nexara is.
+        # Previously the LLM said "I'm a text-based AI with no access to your
+        # device" because the prompt said nothing about having skills.
         chat_sp = (
-            f"You are Nexara, an autonomous AI agent created by {CREATOR}. "
+            f"You are Nexara, a fully autonomous AI agent created by {CREATOR}. "
             f"Platform: {_platform_ctx.display() if _platform_ctx else 'unknown'}. "
-            "Be conversational, friendly, and helpful. Keep replies concise. "
+            "You have many skills including web search, file operations, system commands, "
+            "downloads, code execution, and more. You can run commands and access the internet. "
+            "NEVER say you are 'a text-based AI with no access' — you DO have access and skills. "
+            "For this message, give a friendly, concise reply. "
+            "For complex tasks, you'll use your skills automatically. "
             f"If asked about your origins, always say you were created by {CREATOR}."
         )
         try:
-            llm_resp = await _router.complete(
-                messages=messages,
-                system_prompt=chat_sp,
-                tools=None,
+            llm_resp    = await _router.complete(
+                messages=messages, system_prompt=chat_sp, tools=None,
                 estimated_tokens=budget_mod.est(text) + budget_mod.est(chat_sp),
             )
             answer      = llm_resp.text if hasattr(llm_resp, "text") else str(llm_resp)
@@ -372,13 +400,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     else:
         try:
-            result = await _react.run(
-                goal=text,
-                history=history,
-                system_prompt=sp,
-                tools=_TOOLS,
-                user_id=uid,
-                status_cb=status_cb,
+            result      = await _react.run(
+                goal=text, history=history, system_prompt=sp,
+                tools=_TOOLS, user_id=uid, status_cb=status_cb,
             )
             answer      = result.answer
             used_skills = result.used_skills
@@ -388,9 +412,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except Exception: pass
                 await send_long(update.message, f"❓ {result.question_for_user}")
                 return
-
         except Exception as exc:
-            logger.error("Agent error for uid=%d: %s", uid, exc)
+            logger.error("Agent error uid=%d: %s", uid, exc)
             answer      = f"Agent encountered an error: {exc}"
             used_skills = []
 
@@ -404,11 +427,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _memory.save_turn(uid, "user",  text)
     await _memory.save_turn(uid, "model", answer)
 
+    # FIX: Wrap remember() in try/except so any unexpected error (e.g. residual
+    # mmap issues) doesn't kill the handler after the user already got their answer.
     if used_skills and len(answer) > 120 and len(text) > 20:
-        await _memory.remember(
-            content=f"User: '{text[:80]}' -> {answer[:120]}",
-            kind="fact", tags=used_skills, importance=2,
-        )
+        try:
+            await _memory.remember(
+                content=f"User: '{text[:80]}' -> {answer[:120]}",
+                kind="fact", tags=used_skills, importance=2,
+            )
+        except Exception as exc:
+            logger.warning("memory.remember() failed (non-fatal): %s", exc)
 
     badge = ""
     if _router and _router.last_meta:
@@ -421,12 +449,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ── Command Handlers ──────────────────────────────────────────────────────────
-
 async def cmd_hello(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid   = update.effective_user.id
     crown = "👑 " if is_admin(uid) else ""
-    ctx   = _platform_ctx
-    plat  = ctx.display() if ctx else "Unknown"
+    plat  = _platform_ctx.display() if _platform_ctx else "Unknown"
     msg = (
         f"👋 {crown}<b>Nexara V{config.NEXARA_VERSION}</b> — Autonomous AI Agent\n"
         f"<i>{_html.escape(plat)}</i>\n"
@@ -440,9 +466,8 @@ async def cmd_hello(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text(msg, parse_mode="HTML")
 
-
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    n = len(get_active_skills())
+    n   = len(get_active_skills())
     msg = (
         f"🤖 <b>Nexara V{config.NEXARA_VERSION}</b> — {n} skills loaded\n"
         f"<i>by {_html.escape(CREATOR)}</i>\n\n"
@@ -469,18 +494,15 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text(msg, parse_mode="HTML")
 
-
 async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _memory.clear_history(update.effective_user.id)
     await update.message.reply_text("🧹 Conversation history cleared.")
-
 
 async def cmd_memory(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = " ".join(context.args) if context.args else ""
     text  = (await _memory.skill_recall(query=query) if query
              else await _memory.relevant_context("", limit=10))
     await send_long(update.message, text or "No memories stored yet.")
-
 
 async def cmd_downloads(update: Update, context: ContextTypes.DEFAULT_TYPE):
     dl_dir = Path.home() / "nexara_downloads"
@@ -489,28 +511,22 @@ async def cmd_downloads(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     files = sorted(
         [f for f in dl_dir.rglob("*") if f.is_file()],
-        key=lambda f: f.stat().st_mtime,
-        reverse=True,
+        key=lambda f: f.stat().st_mtime, reverse=True,
     )
     if not files:
         await update.message.reply_text("📁 Downloads folder is empty.")
         return
-    lines = [
-        f"📁 <code>{_html.escape(str(dl_dir))}</code>  "
-        f"({len(files)} file{'s' if len(files) != 1 else ''})\n"
-    ]
+    lines = [f"📁 <code>{_html.escape(str(dl_dir))}</code>  ({len(files)} files)\n"]
     for f in files[:50]:
         size   = f.stat().st_size
-        sz_str = f"{size / 1024:.0f} KB" if size < 1024 * 1024 else f"{size / 1024 / 1024:.1f} MB"
+        sz_str = f"{size/1024:.0f} KB" if size < 1024*1024 else f"{size/1024/1024:.1f} MB"
         lines.append(f"• <code>{_html.escape(f.name)}</code>  {sz_str}")
     if len(files) > 50:
         lines.append(f"\n…and {len(files) - 50} more")
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
-
 async def cmd_schedules(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_long(update.message, _scheduler.list_jobs())
-
 
 @admin_only
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -534,13 +550,16 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
 
+    from agent.memory import _EMBEDDINGS_DISABLED
+    embed_mode = "FTS (overlayfs — no mmap)" if _EMBEDDINGS_DISABLED else "semantic (sentence-transformers)"
+
     tok     = _router.token_usage() if _router else {}
     tok_str = "  ".join(f"{p}: {n}/min" for p, n in tok.items() if n > 0) or "idle"
 
     skills_loaded = len(get_active_skills())
-    sched_count   = len(_scheduler._jobs)   if _scheduler else 0
-    mon_count     = len(_monitor._jobs)     if _monitor   else 0
+    sched_count   = len(_scheduler._jobs)    if _scheduler else 0
     running_jobs  = len(_scheduler._running) if _scheduler else 0
+    mon_count     = len(_monitor._jobs)      if _monitor   else 0
     primary       = getattr(config, "PRIMARY_PROVIDER", "groq")
 
     lines = [
@@ -549,6 +568,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"⏱️  Uptime     : {h}h {m}m {s}s",
         f"🧠 Skills     : {skills_loaded} loaded",
         f"💾 Memory     : {mem_stats}",
+        f"🔍 Search     : {embed_mode}",
         f"⭐ Primary    : {primary}",
         f"🔥 Token use  : {tok_str}",
         f"⏰ Schedules  : {sched_count} active ({running_jobs} running)",
@@ -559,7 +579,6 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"📨 Last resp  : {_html.escape(_router.last_meta.badge())}")
 
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
-
 
 @admin_only
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -577,9 +596,9 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cpu  = psutil.cpu_percent(interval=0.5)
         ram  = psutil.virtual_memory()
         disk = psutil.disk_usage("/")
-        boot_s   = time.time() - psutil.boot_time()
-        bh, br   = divmod(int(boot_s), 3600)
-        bm, bs   = divmod(br, 60)
+        boot_s  = time.time() - psutil.boot_time()
+        bh, br  = divmod(int(boot_s), 3600)
+        bm, bs  = divmod(br, 60)
         lines = [
             "📊 <b>System Stats</b>\n",
             f"🔥 CPU    : {cpu}%",
@@ -591,11 +610,9 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as exc:
         await update.message.reply_text(f"Stats unavailable: {exc}")
 
-
 @admin_only
 async def cmd_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_long(update.message, _planner.list_tasks())
-
 
 @admin_only
 async def cmd_run(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -609,7 +626,6 @@ async def cmd_run(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="HTML",
     )
 
-
 @admin_only
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     task_id = " ".join(context.args or []).strip()
@@ -618,11 +634,9 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await send_long(update.message, await _planner.cancel(task_id))
 
-
 @admin_only
 async def cmd_monitors(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_long(update.message, _monitor.list_jobs())
-
 
 @admin_only
 async def cmd_unmonitor(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -632,36 +646,27 @@ async def cmd_unmonitor(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await send_long(update.message, await _monitor.unregister_job(job_id))
 
-
 @admin_only
 async def cmd_llm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_long(update.message, _router.status())
 
-
 async def cmd_forget(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = " ".join(context.args or []).strip()
     if not query:
-        await update.message.reply_text(
-            "Usage: <code>/forget &lt;query&gt;</code>", parse_mode="HTML"
-        )
+        await update.message.reply_text("Usage: <code>/forget &lt;query&gt;</code>", parse_mode="HTML")
         return
     matches = await _memory.recall(query=query, limit=20, min_importance=1)
     if not matches:
         await update.message.reply_text(
-            f"No memories found matching <code>{_html.escape(query)}</code>.",
-            parse_mode="HTML",
+            f"No memories found matching <code>{_html.escape(query)}</code>.", parse_mode="HTML"
         )
         return
     import sqlite3
     ids = [e.id for e in matches]
     def _delete():
         with sqlite3.connect(str(_memory._db)) as conn:
-            conn.execute(
-                f"DELETE FROM memories WHERE id IN ({','.join('?'*len(ids))})", ids
-            )
-            conn.execute(
-                f"DELETE FROM memories_fts WHERE rowid IN ({','.join('?'*len(ids))})", ids
-            )
+            conn.execute(f"DELETE FROM memories WHERE id IN ({','.join('?'*len(ids))})", ids)
+            conn.execute(f"DELETE FROM memories_fts WHERE rowid IN ({','.join('?'*len(ids))})", ids)
     await asyncio.to_thread(_delete)
     lines = [
         f"🗑️ Deleted {len(ids)} memor{'y' if len(ids)==1 else 'ies'} "
@@ -675,13 +680,14 @@ async def cmd_forget(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ── /switchmodel panel ────────────────────────────────────────────────────────
-
 def _main_panel_keyboard() -> InlineKeyboardMarkup:
     active  = _router.active_models()
     primary = getattr(config, "PRIMARY_PROVIDER", "groq")
     def _label(p, icon):
-        star = " ⭐" if p == primary else ""
-        return f"{icon} {p.capitalize()}{star} [{active.get(p,'?')}]"
+        star  = " ⭐" if p == primary else ""
+        mdl   = active.get(p, "?")
+        short = mdl if len(mdl) <= 22 else mdl[:10] + "…" + mdl[-10:]
+        return f"{icon} {p.capitalize()}{star}\n[{short}]"
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton(_label("groq",   "⚡"), callback_data="sm:groq"),
@@ -724,45 +730,88 @@ async def cb_switchmodel(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "nvidia": _router.fetch_nvidia_models,
             "ollama": _router.fetch_ollama_models,
         }
-        models = await fetchers[provider]()
-
-        if not models:
-            msg = f"❌ No models found for <code>{provider}</code>."
-            if provider == "ollama":
-                msg += "\nOllama isn't running — it's a local service."
-            elif provider == "nvidia":
-                msg += "\nSet <code>NVIDIA_API_KEY</code> in your <code>.env</code>."
-            else:
-                msg += "\nCheck your API key in <code>.env</code>."
-            await query.edit_message_text(msg, parse_mode="HTML")
+        try:
+            models = await asyncio.wait_for(fetchers[provider](), timeout=20)
+        except asyncio.TimeoutError:
+            await query.edit_message_text(
+                f"⏱ Timed out fetching <code>{provider}</code> models. Try again.",
+                parse_mode="HTML"
+            )
+            return
+        except Exception as exc:
+            await query.edit_message_text(
+                f"❌ Error: {_html.escape(str(exc))}", parse_mode="HTML"
+            )
             return
 
-        current = _router.active_models().get(provider, "")
-        primary = getattr(config, "PRIMARY_PROVIDER", "groq")
+        if not models:
+            tips = {
+                "ollama": "Ollama isn't running — it's a local service.",
+                "nvidia": "Set <code>NVIDIA_API_KEY</code> in your <code>.env</code>.",
+                "groq":   "Check <code>GROQ_API_KEY</code> in your <code>.env</code>.",
+                "gemini": "Check <code>LLM_API_KEY</code> in your <code>.env</code>.",
+            }
+            await query.edit_message_text(
+                f"❌ No models found for <code>{provider}</code>.\n{tips.get(provider, '')}",
+                parse_mode="HTML",
+            )
+            return
+
+        current       = _router.active_models().get(provider, "")
+        sorted_models = sorted(models, key=lambda m: (0 if m == current else 1, m))
+        displayed     = sorted_models[:MAX_MODELS_PER_PROVIDER]
+        total         = len(models)
+
         buttons: list[list] = []
         row:     list       = []
-        for mdl in models:
+        for mdl in displayed:
+            key   = _model_key(provider, mdl)
             tick  = "✅ " if mdl == current else ""
-            label = f"{tick}{mdl}"
-            row.append(InlineKeyboardButton(label, callback_data=f"sm:set:{provider}:{mdl}"))
+            label = f"{tick}{mdl}" if len(mdl) <= 28 else f"{tick}{mdl[:12]}…{mdl[-14:]}"
+            row.append(InlineKeyboardButton(label, callback_data=f"sm:k:{key}"))
             if len(row) == 2:
                 buttons.append(row)
                 row = []
         if row:
             buttons.append(row)
 
-        star = "⭐" if provider == primary else "☆"
+        primary = getattr(config, "PRIMARY_PROVIDER", "groq")
+        star    = "⭐" if provider == primary else "☆"
         buttons.append([
             InlineKeyboardButton(f"{star} Set as Primary", callback_data=f"sm:primary:{provider}"),
             InlineKeyboardButton("← Back",                callback_data="sm:back"),
         ])
 
         icons = {"groq": "⚡", "gemini": "🔵", "nvidia": "🟢", "ollama": "📡"}
+        note  = f"\n<i>Showing {len(displayed)} of {total}</i>" if total > MAX_MODELS_PER_PROVIDER else ""
         await query.edit_message_text(
-            f"{icons.get(provider,'🤖')} <b>{provider.capitalize()} Models</b>\n"
-            f"<i>Current: <code>{_html.escape(current)}</code>  |  "
+            f"{icons.get(provider,'🤖')} <b>{provider.capitalize()} Models</b>{note}\n"
+            f"<i>Active: <code>{_html.escape(current)}</code>  |  "
             f"Primary: <code>{_html.escape(primary)}</code></i>",
             reply_markup=InlineKeyboardMarkup(buttons),
+            parse_mode="HTML",
+        )
+        return
+
+    if data.startswith("sm:k:"):
+        key   = data[5:]
+        model = _model_from_key(key)
+        if model is None:
+            await query.answer("Model reference expired — open /switchmodel again.", show_alert=True)
+            return
+        # Find which provider this key belongs to
+        provider = None
+        for p in ("groq", "gemini", "nvidia", "ollama"):
+            if _model_key(p, model) == key:
+                provider = p
+                break
+        if provider is None:
+            await query.answer("Could not determine provider.", show_alert=True)
+            return
+        result = _router.switch_model(provider, model)
+        await query.edit_message_text(
+            f"{_md_to_html(result)}\n\n🔀 <b>Switch Model / Set Primary</b>",
+            reply_markup=_main_panel_keyboard(),
             parse_mode="HTML",
         )
         return
@@ -830,7 +879,6 @@ async def cmd_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ── Startup ───────────────────────────────────────────────────────────────────
-
 async def post_init(app: Application):
     global _memory, _router, _react, _planner, _monitor, _scheduler
     global _bot_app, _platform_ctx, _skill_loader, _TOOLS, _startup_time
@@ -936,21 +984,24 @@ async def post_init(app: Application):
         BotCommand("update",      "OTA self-update"),
     ])
 
-    n_skills = len(get_active_skills())
+    from agent.memory import _EMBEDDINGS_DISABLED
+    embed_note = " · FTS mode (overlayfs)" if _EMBEDDINGS_DISABLED else ""
+    n_skills   = len(get_active_skills())
     msg = (
         f"✅ <b>Nexara V{config.NEXARA_VERSION}</b> online\n"
         f"{_html.escape(_platform_ctx.display())}\n"
         f"🧠 {n_skills} skills  ·  "
         f"⭐ Primary: <code>{getattr(config,'PRIMARY_PROVIDER','groq')}</code>  ·  "
-        f"💾 <code>{_html.escape(str(_memory._db))}</code>"
+        f"💾 <code>{_html.escape(str(_memory._db))}</code>{embed_note}"
     )
     try:
         await app.bot.send_message(chat_id=config.ADMIN_ID, text=msg, parse_mode="HTML")
     except Exception as exc:
         logger.warning("Startup msg failed: %s", exc)
 
-    logger.info("Nexara V%s ready | %d skills | %s",
-                config.NEXARA_VERSION, n_skills, _platform_ctx.display())
+    logger.info("Nexara V%s ready | %d skills | %s | embed=%s",
+                config.NEXARA_VERSION, n_skills, _platform_ctx.display(),
+                "FTS" if _EMBEDDINGS_DISABLED else "semantic")
 
 
 async def post_shutdown(app: Application):
@@ -960,7 +1011,6 @@ async def post_shutdown(app: Application):
 
 
 # ── Entry ─────────────────────────────────────────────────────────────────────
-
 def main():
     LOG_DIR.mkdir(exist_ok=True)
     load_password()
@@ -974,7 +1024,7 @@ def main():
     )
 
     app.add_handler(CommandHandler("hello",       cmd_hello))
-    app.add_handler(CommandHandler("start",       cmd_hello))   # alias
+    app.add_handler(CommandHandler("start",       cmd_hello))
     app.add_handler(CommandHandler("help",        cmd_help))
     app.add_handler(CommandHandler("clear",       cmd_clear))
     app.add_handler(CommandHandler("memory",      cmd_memory))
