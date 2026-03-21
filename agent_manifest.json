@@ -1,0 +1,63 @@
+{
+  "version": "1.1.0",
+  "updated": "2026-03-21",
+  "description": "Nexara Agent core files \u2014 OTA update manifest",
+  "files": {
+    "main.py": {
+      "checksum": "sha256:e6ee740f2bcb4d117beb433d8b0757bb9916fdebda621c2d22c33456250e69cd",
+      "url": "main.py"
+    },
+    "config.py": {
+      "checksum": "sha256:92e6ce6829c12d9941b1746fed156c9a36e6169115433fcb1009fbf287c9e1f5",
+      "url": "config.py"
+    },
+    "agent/llm_router.py": {
+      "checksum": "sha256:f67a1c99c16f4b6d5acb124ceab64ed27652b6d7121e0587a3976c1777b45a77",
+      "url": "agent/llm_router.py"
+    },
+    "agent/tool_schema.py": {
+      "checksum": "sha256:6ed0a6959c20ed8fdb76561e68f05b64644cd77e0dd1129b65ef3ffd2ed82878",
+      "url": "agent/tool_schema.py"
+    },
+    "agent/react_loop.py": {
+      "checksum": "sha256:0a864e546a878c0daea2cdd0f296b032b3611c5a81583881660ddd738de10f66",
+      "url": "agent/react_loop.py"
+    },
+    "agent/memory.py": {
+      "checksum": "sha256:56c7d18ca5758f83a673936c1ef07de84cc81bf24628cb2cdcf17b274b5b7e3f",
+      "url": "agent/memory.py"
+    },
+    "agent/planner.py": {
+      "checksum": "sha256:1c75f325ba37a598a81d6fca39bc5fe5a69fc409eb5cef96bd118c4e6267bb37",
+      "url": "agent/planner.py"
+    },
+    "tasks/scheduler.py": {
+      "checksum": "sha256:d5ba0a9123e3dcc4c5fe46c57263959d6aa886b0f5035419d610cf5a6f47be5b",
+      "url": "tasks/scheduler.py"
+    },
+    "tasks/monitor_task.py": {
+      "checksum": "sha256:701a52426184aaacf9a7e4f99616573057e50c4c3e68d59abd8fe810842445ef",
+      "url": "tasks/monitor_task.py"
+    },
+    "utils/skill_loader.py": {
+      "checksum": "sha256:c7478233e41583349f41f6f1fe1bf4b2182382c308cdf4414bdc73dd1546dfab",
+      "url": "utils/skill_loader.py"
+    },
+    "utils/agent_updater.py": {
+      "checksum": "sha256:ba345c43549897d251063d0502acb6fe39cc678472aec2d584a5ab14faadebab",
+      "url": "utils/agent_updater.py"
+    },
+    "utils/platform.py": {
+      "checksum": "sha256:0603bbb05d107e502258e354627f97be212b10384852ee8757c8ddb34e9ed9a3",
+      "url": "utils/platform.py"
+    },
+    "utils/token_budget.py": {
+      "checksum": "sha256:480e946371ce74260296ed54315b7c2d527ab0e635f6b6d89c85328d9ab444f5",
+      "url": "utils/token_budget.py"
+    },
+    "utils/skill_router.py": {
+      "checksum": "sha256:0af92d2c537a0b043ae0d30539ac83dcd41e29d883bc121156d6fc8063e03955",
+      "url": "utils/skill_router.py"
+    }
+  }
+}

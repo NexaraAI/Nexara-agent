@@ -41,9 +41,20 @@ def _fn(name: str, description: str, properties: dict, required: list[str] | Non
 
 TOOL_SCHEMAS: list[dict] = [
 
-    # ── Web ───────────────────────────────────────────────────────────────────
-    _fn("speedtest", "Run an internet speed test. Returns download/upload Mbit/s and ping.", {}),
+    # ── File generation ──────────────────────────────────────────────────────
+    _fn("file_generate",
+        "Generate and save a file in any format: pdf, docx, html, txt, md, csv, json, xml, xlsx. "
+        "Returns the file path so it is auto-sent to the user. "
+        "ALWAYS use this when the user asks to create, save, or export any document or file.",
+        {"content":  _str("Full text content for the file"),
+         "format":   _str("File format", ["pdf","docx","html","txt","md","csv","json","xml","xlsx"]),
+         "filename": _str("Output filename without extension"),
+         "title":    _str("Optional document title shown in the file header")},
+        required=["content", "format", "filename"]),
 
+    _fn("speedtest", "Run an internet speed test. Returns download/upload Mbit/s and ping. No args needed.", {}),
+
+    # ── Web ───────────────────────────────────────────────────────────────────
     _fn("web_search", "Search the web using DuckDuckGo.",
         {"query": _str("Search query")}, required=["query"]),
 
@@ -172,10 +183,15 @@ TOOL_SCHEMAS: list[dict] = [
         required=["action"]),
 
     # ── Scheduler ─────────────────────────────────────────────────────────────
-    _fn("schedule_task", "Schedule a recurring task.",
-        {"goal":     _str("What to do"),
-         "schedule": _str("When, e.g. 'every day at 8am'"),
-         "task_id":  _str("Optional unique ID")},
+    _fn("schedule_task",
+        "Schedule a task to run automatically. ALWAYS use this when the user says "
+        "'remind me', 'every day', 'every hour', 'at 8am', 'schedule', 'set a timer', "
+        "'every morning', 'every week', 'in X minutes', or any recurring/future time request. "
+        "schedule must be natural language: 'every day at 9am', 'every 30 minutes', "
+        "'every monday at noon', 'in 5 minutes'.",
+        {"goal":     _str("Exactly what to do when the schedule fires"),
+         "schedule": _str("When to run: 'every day at 8am', 'every 30 minutes', 'in 5 minutes', 'every monday at noon'"),
+         "task_id":  _str("Optional unique ID — omit to auto-generate")},
         required=["goal", "schedule"]),
 
     _fn("list_schedules",  "List all scheduled tasks.", {}),

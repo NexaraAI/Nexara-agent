@@ -54,6 +54,7 @@ from utils import platform as platform_mod
 from utils.platform import PlatformContext
 from utils import token_budget as budget_mod
 from utils.skill_loader import SkillLoader
+from utils.agent_updater import AgentUpdater
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 LOG_DIR = Path.home() / ".nexara"
@@ -79,6 +80,7 @@ _scheduler:    NaturalScheduler | None   = None
 _bot_app:      Application | None       = None
 _platform_ctx: PlatformContext | None   = None
 _skill_loader: SkillLoader | None       = None
+_updater:      AgentUpdater | None      = None
 _startup_time: float                    = time.time()
 
 _TOOLS: list[dict] | None = None
@@ -179,8 +181,9 @@ Emit exactly one JSON block per step.
 - Download failures: retry with different URL or search for mirror.
 - Code failures: read the error, fix, re-run.
 - Always report file paths so files can be auto-sent to user.
-- For scheduling: use schedule_task with natural language timing.
-- For memory: use remember (importance 1-5) and recall proactively.
+- File creation (PDF, DOCX, TXT, HTML, MD, CSV, JSON, XML, XLSX): ALWAYS use file_generate skill. NEVER tell the user to use an external website or copy-paste text. Never claim you cannot create files.
+- Scheduling: when the user says "remind me", "every day", "at 8am", "every hour", "in X minutes", "every week", "schedule", or any future/recurring time — ALWAYS call schedule_task immediately. Do not ask for confirmation first.
+- Memory: use remember (importance 1-5) and recall proactively.
 """
     return _PROMPT_CACHE
 
@@ -681,13 +684,23 @@ async def cmd_forget(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ── /switchmodel panel ────────────────────────────────────────────────────────
+# Paginated model list: 10 per page so NVIDIA 100+ models all work.
+# Page state in callback_data: sm:page:{provider}:{page}
+# Model selection uses 8-char MD5 hash: sm:k:{key}  (safe vs 64-byte limit)
+
+MODELS_PER_PAGE = 10
+
+# Per-provider model cache so pagination doesn't re-fetch on every page turn
+_model_cache: dict[str, list[str]] = {}
+
+
 def _main_panel_keyboard() -> InlineKeyboardMarkup:
     active  = _router.active_models()
     primary = getattr(config, "PRIMARY_PROVIDER", "groq")
     def _label(p, icon):
         star  = " ⭐" if p == primary else ""
         mdl   = active.get(p, "?")
-        short = mdl if len(mdl) <= 22 else mdl[:10] + "…" + mdl[-10:]
+        short = mdl if len(mdl) <= 20 else mdl[:9] + "…" + mdl[-9:]
         return f"{icon} {p.capitalize()}{star}\n[{short}]"
     return InlineKeyboardMarkup([
         [
@@ -699,6 +712,71 @@ def _main_panel_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton(_label("ollama", "📡"), callback_data="sm:ollama"),
         ],
     ])
+
+
+def _model_page_keyboard(provider: str, models: list[str], page: int) -> InlineKeyboardMarkup:
+    current     = _router.active_models().get(provider, "")
+    total_pages = max(1, (len(models) + MODELS_PER_PAGE - 1) // MODELS_PER_PAGE)
+    page        = max(0, min(page, total_pages - 1))
+    page_models = models[page * MODELS_PER_PAGE : (page + 1) * MODELS_PER_PAGE]
+
+    buttons: list[list] = []
+    row:     list       = []
+    for mdl in page_models:
+        key   = _model_key(provider, mdl)
+        tick  = "✅ " if mdl == current else ""
+        label = f"{tick}{mdl}" if len(mdl) <= 26 else f"{tick}{mdl[:11]}…{mdl[-13:]}"
+        row.append(InlineKeyboardButton(label, callback_data=f"sm:k:{key}"))
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+
+    # Navigation row (only shown when there are multiple pages)
+    if total_pages > 1:
+        nav: list = []
+        if page > 0:
+            nav.append(InlineKeyboardButton(
+                "◀ Prev", callback_data=f"sm:page:{provider}:{page-1}"
+            ))
+        nav.append(InlineKeyboardButton(
+            f"· {page+1}/{total_pages} ·", callback_data="sm:noop"
+        ))
+        if page < total_pages - 1:
+            nav.append(InlineKeyboardButton(
+                "Next ▶", callback_data=f"sm:page:{provider}:{page+1}"
+            ))
+        buttons.append(nav)
+
+    # Action row
+    primary = getattr(config, "PRIMARY_PROVIDER", "groq")
+    star    = "⭐" if provider == primary else "☆"
+    buttons.append([
+        InlineKeyboardButton(f"{star} Set as Primary", callback_data=f"sm:primary:{provider}"),
+        InlineKeyboardButton("← Back",                callback_data="sm:back"),
+    ])
+
+    return InlineKeyboardMarkup(buttons)
+
+
+async def _show_model_page(query, provider: str, models: list[str], page: int):
+    current     = _router.active_models().get(provider, "")
+    primary     = getattr(config, "PRIMARY_PROVIDER", "groq")
+    total_pages = max(1, (len(models) + MODELS_PER_PAGE - 1) // MODELS_PER_PAGE)
+    icons       = {"groq": "⚡", "gemini": "🔵", "nvidia": "🟢", "ollama": "📡"}
+
+    header = (
+        f"{icons.get(provider,'🤖')} <b>{provider.capitalize()} Models</b>  "
+        f"<i>({len(models)} total)</i>\n"
+        f"<i>Active: <code>{_html.escape(current)}</code>  |  "
+        f"Primary: <code>{_html.escape(primary)}</code></i>"
+    )
+    await query.edit_message_text(
+        header,
+        reply_markup=_model_page_keyboard(provider, models, page),
+        parse_mode="HTML",
+    )
 
 
 @admin_only
@@ -720,6 +798,11 @@ async def cb_switchmodel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     data = query.data
 
+    # No-op (page counter button)
+    if data == "sm:noop":
+        return
+
+    # Provider selected → fetch models, show page 0
     if data in ("sm:groq", "sm:gemini", "sm:nvidia", "sm:ollama"):
         provider = data.split(":")[1]
         await query.edit_message_text(
@@ -735,8 +818,7 @@ async def cb_switchmodel(update: Update, context: ContextTypes.DEFAULT_TYPE):
             models = await asyncio.wait_for(fetchers[provider](), timeout=20)
         except asyncio.TimeoutError:
             await query.edit_message_text(
-                f"⏱ Timed out fetching <code>{provider}</code> models. Try again.",
-                parse_mode="HTML"
+                f"⏱ Timed out fetching <code>{provider}</code> models.", parse_mode="HTML"
             )
             return
         except Exception as exc:
@@ -753,59 +835,49 @@ async def cb_switchmodel(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "gemini": "Check <code>LLM_API_KEY</code> in your <code>.env</code>.",
             }
             await query.edit_message_text(
-                f"❌ No models found for <code>{provider}</code>.\n{tips.get(provider, '')}",
+                f"❌ No models found for <code>{provider}</code>.\n{tips.get(provider,'')}",
                 parse_mode="HTML",
             )
             return
 
+        # Sort: current model first, then alphabetical
         current       = _router.active_models().get(provider, "")
         sorted_models = sorted(models, key=lambda m: (0 if m == current else 1, m))
-        displayed     = sorted_models[:MAX_MODELS_PER_PROVIDER]
-        total         = len(models)
+        _model_cache[provider] = sorted_models
+        for m in sorted_models:
+            _model_key(provider, m)  # pre-register all hash keys
 
-        buttons: list[list] = []
-        row:     list       = []
-        for mdl in displayed:
-            key   = _model_key(provider, mdl)
-            tick  = "✅ " if mdl == current else ""
-            label = f"{tick}{mdl}" if len(mdl) <= 28 else f"{tick}{mdl[:12]}…{mdl[-14:]}"
-            row.append(InlineKeyboardButton(label, callback_data=f"sm:k:{key}"))
-            if len(row) == 2:
-                buttons.append(row)
-                row = []
-        if row:
-            buttons.append(row)
-
-        primary = getattr(config, "PRIMARY_PROVIDER", "groq")
-        star    = "⭐" if provider == primary else "☆"
-        buttons.append([
-            InlineKeyboardButton(f"{star} Set as Primary", callback_data=f"sm:primary:{provider}"),
-            InlineKeyboardButton("← Back",                callback_data="sm:back"),
-        ])
-
-        icons = {"groq": "⚡", "gemini": "🔵", "nvidia": "🟢", "ollama": "📡"}
-        note  = f"\n<i>Showing {len(displayed)} of {total}</i>" if total > MAX_MODELS_PER_PROVIDER else ""
-        await query.edit_message_text(
-            f"{icons.get(provider,'🤖')} <b>{provider.capitalize()} Models</b>{note}\n"
-            f"<i>Active: <code>{_html.escape(current)}</code>  |  "
-            f"Primary: <code>{_html.escape(primary)}</code></i>",
-            reply_markup=InlineKeyboardMarkup(buttons),
-            parse_mode="HTML",
-        )
+        await _show_model_page(query, provider, sorted_models, 0)
         return
 
+    # Page navigation
+    if data.startswith("sm:page:"):
+        parts    = data.split(":")
+        provider = parts[2]
+        page     = int(parts[3])
+        models   = _model_cache.get(provider, [])
+        if not models:
+            await query.answer(
+                "Model list expired — tap the provider button again.", show_alert=True
+            )
+            return
+        await _show_model_page(query, provider, models, page)
+        return
+
+    # Model selected via hash key
     if data.startswith("sm:k:"):
         key   = data[5:]
         model = _model_from_key(key)
         if model is None:
-            await query.answer("Model reference expired — open /switchmodel again.", show_alert=True)
+            await query.answer(
+                "Model ref expired — open /switchmodel again.", show_alert=True
+            )
             return
-        # Find which provider this key belongs to
-        provider = None
-        for p in ("groq", "gemini", "nvidia", "ollama"):
-            if _model_key(p, model) == key:
-                provider = p
-                break
+        provider = next(
+            (p for p in ("groq", "gemini", "nvidia", "ollama")
+             if _model_key(p, model) == key),
+            None,
+        )
         if provider is None:
             await query.answer("Could not determine provider.", show_alert=True)
             return
@@ -817,6 +889,7 @@ async def cb_switchmodel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    # Legacy full-name fallback
     if data.startswith("sm:set:"):
         _, _, provider, *model_parts = data.split(":")
         model  = ":".join(model_parts)
@@ -828,6 +901,7 @@ async def cb_switchmodel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    # Set primary
     if data.startswith("sm:primary:"):
         provider = data.split(":")[2]
         result   = _router.set_primary(provider)
@@ -840,13 +914,13 @@ async def cb_switchmodel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    # Back
     if data == "sm:back":
         await query.edit_message_text(
             "🔀 <b>Switch Model / Set Primary</b>\nChoose a provider:",
             reply_markup=_main_panel_keyboard(),
             parse_mode="HTML",
         )
-
 
 def _persist_env(key: str, value: str):
     env_path = Path(__file__).parent / ".env"
@@ -871,7 +945,21 @@ def _persist_env(key: str, value: str):
 
 @admin_only
 async def cmd_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🔄 OTA update started. Back in ~15s.")
+    """Check for agent updates, then skills update via git pull."""
+    msg = await update.message.reply_text("🔄 Checking for updates…")
+
+    # Step 1: Agent file update via agent_manifest.json
+    if _updater and config.AGENT_REPO_URL:
+        try:
+            result = await _updater.check_and_apply(force=True)
+            # If we reach here, no restart happened (nothing changed)
+            await msg.edit_text(f"🔄 {result}\n\nRunning git pull…")
+        except Exception as exc:
+            await msg.edit_text(f"⚠️ Agent update check failed: {exc}\n\nRunning git pull…")
+    else:
+        await msg.edit_text("ℹ️ AGENT_REPO_URL not set — skipping agent file update.\n\nRunning git pull…")
+
+    # Step 2: git pull + pip deps (existing behaviour)
     script = Path(__file__).parent / "update.sh"
     subprocess.Popen(
         ["bash", str(script)],
@@ -914,6 +1002,16 @@ async def post_init(app: Application):
 
     _router = LLMRouter(config)
     _router.on_switch_cb = telegram_alert
+
+    # Agent auto-updater
+    global _updater
+    if config.AGENT_REPO_URL:
+        _updater = AgentUpdater(repo_url=config.AGENT_REPO_URL, alert_cb=telegram_alert)
+        logger.info("AgentUpdater ready — repo: %s", config.AGENT_REPO_URL)
+        # Non-blocking startup check — runs in background, won't delay bot start
+        asyncio.create_task(_updater.check_and_apply(force=False))
+    else:
+        logger.info("AgentUpdater disabled — AGENT_REPO_URL not set")
 
     _react = ReactLoop(router=_router, skill_exec=execute_skill)
 

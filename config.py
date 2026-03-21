@@ -27,17 +27,15 @@ OLLAMA_URL: str   = os.getenv("OLLAMA_URL", "http://localhost:11434")
 OLLAMA_MODEL: str = os.getenv("OLLAMA_MODEL", "llama3")
 
 # ── LLM: Router config ────────────────────────────────────────────────────────
-# Which provider to try first. Options: groq | gemini | nvidia | ollama
 PRIMARY_PROVIDER: str = os.getenv("PRIMARY_PROVIDER", "groq")
 
 # ── Agent ─────────────────────────────────────────────────────────────────────
 NEXARA_VERSION: str       = os.getenv("NEXARA_VERSION", "1.0.0")
 BOT_NAME:       str       = "Nexara"
-MAX_HISTORY_TURNS: int    = 40   # hard cap — token budget trims dynamically
+MAX_HISTORY_TURNS: int    = 40
 MAX_REACT_ITERATIONS: int = 14
 
 # ── Android ───────────────────────────────────────────────────────────────────
-# Set automatically by start.sh and platform.py — do not set manually
 TERMUX_API_AVAILABLE: bool = os.getenv("TERMUX_API_AVAILABLE", "0") == "1"
 
 # ── Downloads ─────────────────────────────────────────────────────────────────
@@ -45,10 +43,14 @@ DOWNLOADS_DIR: Path         = Path.home() / "nexara_downloads"
 MAX_DOWNLOAD_SIZE_GB: float = float(os.getenv("MAX_DOWNLOAD_SIZE_GB", "2.0"))
 
 # ── Skills warehouse ──────────────────────────────────────────────────────────
-# Release channel: stable | beta | dev
-SKILL_CHANNEL: str      = os.getenv("SKILL_CHANNEL", "stable")
-# Override warehouse URL (leave empty for default GitHub repo)
+SKILL_CHANNEL: str       = os.getenv("SKILL_CHANNEL", "stable")
 SKILL_WAREHOUSE_URL: str = os.getenv("SKILL_WAREHOUSE_URL", "")
+
+# ── Agent auto-updater ────────────────────────────────────────────────────────
+# Set to your nexara-agent repo raw GitHub URL, e.g.:
+#   https://raw.githubusercontent.com/YourOrg/nexara-agent/main
+# Leave empty to disable agent auto-updates.
+AGENT_REPO_URL: str = os.getenv("AGENT_REPO_URL", "")
 
 # ── JVM flags (Android/Termux only) ──────────────────────────────────────────
 os.environ.setdefault(
