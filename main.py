@@ -374,18 +374,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if mode == "chat":
         messages = list(history[-6:])
         messages.append({"role": "user", "parts": [text]})
-        # FIX: Chat system prompt now explicitly tells the LLM what Nexara is.
-        # Previously the LLM said "I'm a text-based AI with no access to your
-        # device" because the prompt said nothing about having skills.
+        # Chat mode = pure conversation only. NO skill/tool references here.
+        # Mentioning "you have skills / can run commands" causes the LLM to
+        # hallucinate executing them and fabricate results (e.g. inventing
+        # speed test numbers from history context). Chat mode only handles
+        # greetings and reactions — everything else is already routed to
+        # agent mode by classify_intent().
         chat_sp = (
-            f"You are Nexara, a fully autonomous AI agent created by {CREATOR}. "
-            f"Platform: {_platform_ctx.display() if _platform_ctx else 'unknown'}. "
-            "You have many skills including web search, file operations, system commands, "
-            "downloads, code execution, and more. You can run commands and access the internet. "
-            "NEVER say you are 'a text-based AI with no access' — you DO have access and skills. "
-            "For this message, give a friendly, concise reply. "
-            "For complex tasks, you'll use your skills automatically. "
-            f"If asked about your origins, always say you were created by {CREATOR}."
+            f"You are Nexara, an AI assistant created by {CREATOR}. "
+            "Reply conversationally and concisely. "
+            "Do NOT attempt to run, execute, or simulate any commands or tools — "
+            "just respond naturally to what the user said. "
+            "Do NOT fabricate any results, numbers, or outputs. "
+            f"If asked about your origins, say you were created by {CREATOR}."
         )
         try:
             llm_resp    = await _router.complete(

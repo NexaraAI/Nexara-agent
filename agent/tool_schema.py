@@ -42,6 +42,8 @@ def _fn(name: str, description: str, properties: dict, required: list[str] | Non
 TOOL_SCHEMAS: list[dict] = [
 
     # ── Web ───────────────────────────────────────────────────────────────────
+    _fn("speedtest", "Run an internet speed test. Returns download/upload Mbit/s and ping.", {}),
+
     _fn("web_search", "Search the web using DuckDuckGo.",
         {"query": _str("Search query")}, required=["query"]),
 
