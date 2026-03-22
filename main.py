@@ -54,6 +54,8 @@ from utils import platform as platform_mod
 from utils.platform import PlatformContext
 from utils import token_budget as budget_mod
 from utils.skill_loader import SkillLoader
+from utils.skill_classifier import SkillClassifier, skill_label
+from utils.error_formatter import friendly as _friendly_error
 from utils.agent_updater import AgentUpdater
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -84,6 +86,9 @@ _updater:      AgentUpdater | None      = None
 _startup_time: float                    = time.time()
 
 _TOOLS: list[dict] | None = None
+
+# Per-user last-run debug trace: uid → list of step dicts
+_debug_traces: dict[int, list[dict]] = {}
 _PROMPT_CACHE: str        = ""
 CREATOR                   = "DemonZ Development"
 
@@ -141,7 +146,7 @@ def build_system_prompt(force: bool = False) -> str:
     platform = ctx.display() if ctx else "Unknown"
     api_flag = "ENABLED" if (ctx and ctx.termux_api) else "DISABLED"
 
-    _PROMPT_CACHE = f"""You are **Nexara**, a fully autonomous AI agent.
+    _PROMPT_CACHE = f"""You are **Nexara**, a fully autonomous AI agent running on a real computer with full shell access.
 
 ## Identity
 - You were created by **{CREATOR}**
@@ -153,10 +158,23 @@ def build_system_prompt(force: bool = False) -> str:
 - Termux:API : {api_flag}
 - Version    : {config.NEXARA_VERSION}
 
-## Rules
-- You ALWAYS use skills to act. Never say "I can't" — use the right skill.
-- Only use skills listed below — they are pre-filtered for this platform.
-- Chain skills when needed: download → analyze_file → summarise → final_answer
+## CRITICAL RULES — You are NOT a chatbot. You have real system access.
+- **NEVER say "I can't", "I don't have access", "this environment restricts", or "I'm a text-based AI".**
+  These statements are FALSE. You have a real shell on a real machine and can execute commands.
+- You CAN install software: use `apt_install` for packages (e.g. `apt_install java` → installs openjdk)
+- You CAN run commands: use `command` skill — sudo is allowed (e.g. `sudo apt-get install -y openjdk-17-jdk`)
+- You CAN create files in ANY format: use `file_generate` skill (pdf, docx, xlsx, html, txt, md, csv, json, xml)
+- You CAN search the web: use `web_search` skill
+- You CAN run Python code: use `run_code` skill
+- You CAN read/write files: use `read_file` / `write_file` skills
+
+## Concrete examples of what you MUST do (not refuse):
+- "Install Java" → `apt_install` with package="openjdk-17-jdk"
+- "Install Node" → `apt_install` with package="nodejs"
+- "Make a PDF" → `file_generate` with format="pdf"
+- "Run this script" → `run_code` or `command`
+- "Search for X" → `web_search`
+- "Remind me at 9am" → `schedule_task`
 
 ## ReAct Protocol
 Emit exactly one JSON block per step.
@@ -178,11 +196,12 @@ Emit exactly one JSON block per step.
 {skill_descriptions()}
 
 ## Behaviour
+- Install failures: try `apt_install` first, then `command` with `sudo apt-get install -y <pkg>`.
 - Download failures: retry with different URL or search for mirror.
-- Code failures: read the error, fix, re-run.
+- Code failures: read the error, fix, re-run — never give up after first attempt.
 - Always report file paths so files can be auto-sent to user.
-- File creation (PDF, DOCX, TXT, HTML, MD, CSV, JSON, XML, XLSX): ALWAYS use file_generate skill. NEVER tell the user to use an external website or copy-paste text. Never claim you cannot create files.
-- Scheduling: when the user says "remind me", "every day", "at 8am", "every hour", "in X minutes", "every week", "schedule", or any future/recurring time — ALWAYS call schedule_task immediately. Do not ask for confirmation first.
+- File creation (PDF, DOCX, TXT, HTML, MD, CSV, JSON, XML, XLSX): ALWAYS use file_generate. NEVER tell the user to use an external website or copy-paste. NEVER say you cannot create files.
+- Scheduling: when the user says "remind me", "every day", "at 8am", "every hour", "in X minutes", "every week", "schedule" — ALWAYS call schedule_task immediately.
 - Memory: use remember (importance 1-5) and recall proactively.
 """
     return _PROMPT_CACHE
@@ -334,6 +353,38 @@ FILE_PATH_RE = re.compile(
 )
 
 
+# ── Intent status helper ─────────────────────────────────────────────────────
+
+def _intent_status(text: str, mode: str) -> str:
+    """Return an initial status message based on what the user asked."""
+    if mode == "chat":
+        return "💬 Responding..."
+    g = text.lower()
+    if any(w in g for w in ("research", "search", "find", "look up", "who is", "what is")):
+        return "🔍 Researching..."
+    if any(w in g for w in ("pdf", "docx", "document", "report", "spreadsheet", "excel")):
+        return "📄 Generating document..."
+    if any(w in g for w in ("install", "apt", "package", "java", "node", "npm")):
+        return "📦 Planning installation..."
+    if any(w in g for w in ("code", "script", "program", "function", "debug", "fix bug")):
+        return "⚙️ Writing code..."
+    if any(w in g for w in ("schedule", "remind", "every day", "every hour", "daily")):
+        return "📅 Setting up schedule..."
+    if any(w in g for w in ("download", "youtube", "video", "mp3", "audio")):
+        return "⬇️ Preparing download..."
+    if any(w in g for w in ("translate", "translation")):
+        return "🌐 Translating..."
+    if any(w in g for w in ("weather", "temperature", "forecast")):
+        return "🌤️ Checking weather..."
+    if any(w in g for w in ("speed test", "speedtest", "internet speed", "bandwidth")):
+        return "🚀 Testing connection..."
+    if any(w in g for w in ("disk", "storage", "space", "cpu", "ram", "memory", "system")):
+        return "🖥️ Checking system..."
+    if any(w in g for w in ("send", "email", "discord", "slack")):
+        return "📧 Preparing message..."
+    return "🧠 Thinking..."
+
+
 # ── Core message handler ──────────────────────────────────────────────────────
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid  = update.effective_user.id
@@ -354,23 +405,37 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     mode        = classify_intent(text)
     raw_history = await _memory.load_history(uid, limit=config.MAX_HISTORY_TURNS)
     sp          = build_system_prompt()
-    budgeted    = budget_mod.apply(text, raw_history, sp)
-    history     = budgeted.trimmed_history
 
-    mem_ctx = ""
-    if budgeted.memory_slots > 0:
-        mem_ctx = await _memory.relevant_context(text, limit=budgeted.memory_slots)
+    # Pass active skill count so token budget accounts for classifier-filtered tools
+    active_skills_list = get_active_skills()
+    budgeted = budget_mod.apply(text, raw_history, sp, tools_count=len(active_skills_list))
+    history  = budgeted.trimmed_history
+
+    # Memory context — inject more memories in agent mode since classifier frees tokens
+    mem_ctx   = ""
+    mem_limit = budgeted.memory_slots if mode == "chat" else max(budgeted.memory_slots, 5)
+    if mem_limit > 0 and len(text) > 15:
+        mem_ctx = await _memory.relevant_context(text, limit=mem_limit)
     if mem_ctx:
         sp = sp + f"\n\n{mem_ctx}"
 
-    # Plain-text spinner — no parse_mode (skill names contain underscores)
+    # Status message — updated in real-time as agent works
+    # Also tracks last status for persistent display (Fix #8)
+    _last_status: list[str] = ["🧠 Thinking…"]
     status_msg = await update.message.reply_text("🧠 Thinking…")
 
     async def status_cb(msg: str):
+        if msg:
+            _last_status[0] = msg
         try:
-            await status_msg.edit_text(msg)
+            await status_msg.edit_text(msg or _last_status[0])
         except Exception:
             pass
+
+    # Show contextual initial status based on intent
+    initial_status = _intent_status(text, mode)
+    if initial_status != "🧠 Thinking…":
+        await status_cb(initial_status)
 
     t0 = time.time()
 
@@ -406,7 +471,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             result      = await _react.run(
                 goal=text, history=history, system_prompt=sp,
-                tools=_TOOLS, user_id=uid, status_cb=status_cb,
+                tools=_TOOLS, active_skills=get_active_skills(),
+                user_id=uid, status_cb=status_cb,
             )
             answer      = result.answer
             used_skills = result.used_skills
@@ -418,7 +484,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
         except Exception as exc:
             logger.error("Agent error uid=%d: %s", uid, exc)
-            answer      = f"Agent encountered an error: {exc}"
+            answer      = _friendly_error(exc)
             used_skills = []
 
     elapsed = time.time() - t0
@@ -430,6 +496,28 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await _memory.save_turn(uid, "user",  text)
     await _memory.save_turn(uid, "model", answer)
+
+    # Save debug trace for /debug command
+    if mode == "agent" and 'result' in dir():
+        try:
+            _debug_traces[uid] = [
+                {
+                    "step":      s.iteration,
+                    "action":    s.action,
+                    "args":      s.args,
+                    "thought":   s.thought[:120] if s.thought else "",
+                    "ok":        s.success,
+                    "obs":       s.observation[:200] if s.observation else "",
+                    "replanned": s.replanned,
+                }
+                for s in getattr(result, "steps", [])
+            ]
+            # Keep only last 50 traces to avoid memory growth
+            if len(_debug_traces) > 50:
+                oldest = min(_debug_traces.keys())
+                del _debug_traces[oldest]
+        except Exception:
+            pass
 
     # FIX: Wrap remember() in try/except so any unexpected error (e.g. residual
     # mmap issues) doesn't kill the handler after the user already got their answer.
@@ -480,7 +568,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "  /help        — this message\n"
         "  /clear       — reset conversation\n"
         "  /memory      — search long-term memory\n"
-        "  /forget      — delete memories by query\n"
+        "  /forget      - delete memories by query\n"
+        "  /history     - show conversation history\n"
         "  /downloads   — list downloaded files\n"
         "  /schedules   — recurring tasks\n"
         "  /status      — full system status\n\n"
@@ -681,6 +770,73 @@ async def cmd_forget(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(matches) > 8:
         lines.append(f"  …and {len(matches)-8} more")
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
+# ── /history command ─────────────────────────────────────────────────────────
+
+async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show the last N conversation turns for this user."""
+    uid   = update.effective_user.id
+    limit = 10
+    if context.args:
+        try: limit = max(1, min(int(context.args[0]), 30))
+        except ValueError: pass
+
+    rows = await _memory.load_history(uid, limit=limit)
+    if not rows:
+        await update.message.reply_text("No conversation history yet.")
+        return
+
+    lines = [f"💬 <b>Last {len(rows)} turns</b>\n"]
+    for r in rows:
+        role  = r.get("role", "?")
+        parts = r.get("parts", [])
+        text  = " ".join(parts) if isinstance(parts, list) else str(parts)
+        icon  = "👤" if role == "user" else "🤖"
+        lines.append(f"{icon} <i>{_html.escape(text[:120])}{'…' if len(text) > 120 else ''}</i>")
+
+    await send_long(update.message, "\n".join(lines))
+
+
+# ── /debug command ────────────────────────────────────────────────────────────
+
+@admin_only
+async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show the last ReAct trace — what skills were called, what they returned."""
+    uid   = update.effective_user.id
+    trace = _debug_traces.get(uid)
+
+    if not trace:
+        await update.message.reply_text(
+            "No debug trace yet — send an agent-mode message first."
+        )
+        return
+
+    lines = [f"🔬 <b>Last ReAct trace</b>  ({len(trace)} step{'s' if len(trace)!=1 else ''})\n"]
+
+    for s in trace:
+        status = "✅" if s["ok"] else "❌"
+        replay = " 🔁" if s["replanned"] else ""
+        lines.append(
+            f"<b>Step {s['step']}</b> {status}{replay}  "
+            f"<code>{_html.escape(s['action'])}</code>"
+        )
+        if s.get("thought"):
+            lines.append(f"  💭 {_html.escape(s['thought'])}")
+        if s.get("args"):
+            import json as _json
+            args_str = _json.dumps(s["args"], ensure_ascii=False)[:120]
+            lines.append(f"  📥 args: <code>{_html.escape(args_str)}</code>")
+        if s.get("obs"):
+            obs = s["obs"]
+            lines.append(f"  📤 {_html.escape(obs[:150])}{'…' if len(obs) > 150 else ''}")
+        lines.append("")
+
+    # Show which skills the classifier selected
+    if _router and _router.last_meta:
+        lines.append(f"📊 Provider: {_html.escape(_router.last_meta.badge())}")
+
+    await send_long(update.message, "\n".join(lines))
 
 
 # ── /switchmodel panel ────────────────────────────────────────────────────────
@@ -1019,6 +1175,7 @@ async def post_init(app: Application):
         react_loop=_react, memory=_memory,
         system_prompt_fn=build_system_prompt,
         alert_cb=telegram_alert, tools=_TOOLS,
+        active_skills_fn=get_active_skills,
     )
     await _planner.start()
 
@@ -1069,6 +1226,8 @@ async def post_init(app: Application):
         BotCommand("clear",       "Reset conversation"),
         BotCommand("memory",      "Search long-term memory"),
         BotCommand("forget",      "Delete memories by query"),
+        BotCommand("history",     "Show conversation history"),
+        BotCommand("debug",       "Last ReAct trace (admin)"),
         BotCommand("downloads",   "Downloaded files"),
         BotCommand("schedules",   "Recurring tasks"),
         BotCommand("status",      "Full system status"),
@@ -1128,6 +1287,8 @@ def main():
     app.add_handler(CommandHandler("clear",       cmd_clear))
     app.add_handler(CommandHandler("memory",      cmd_memory))
     app.add_handler(CommandHandler("forget",      cmd_forget))
+    app.add_handler(CommandHandler("history",     cmd_history))
+    app.add_handler(CommandHandler("debug",       cmd_debug))
     app.add_handler(CommandHandler("downloads",   cmd_downloads))
     app.add_handler(CommandHandler("schedules",   cmd_schedules))
     app.add_handler(CommandHandler("status",      cmd_status))

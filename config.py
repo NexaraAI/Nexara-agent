@@ -12,7 +12,7 @@ ADMIN_ID: int       = int(os.environ["ADMIN_ID"])
 
 # ── LLM: Gemini ───────────────────────────────────────────────────────────────
 LLM_API_KEY: str  = os.getenv("LLM_API_KEY", "")
-LLM_MODEL: str    = os.getenv("LLM_MODEL", "gemini-1.5-flash")
+LLM_MODEL: str    = os.getenv("LLM_MODEL", "gemini-2.5-flash")
 
 # ── LLM: Groq ─────────────────────────────────────────────────────────────────
 GROQ_API_KEY: str  = os.getenv("GROQ_API_KEY", "")
@@ -27,7 +27,7 @@ OLLAMA_URL: str   = os.getenv("OLLAMA_URL", "http://localhost:11434")
 OLLAMA_MODEL: str = os.getenv("OLLAMA_MODEL", "llama3")
 
 # ── LLM: Router config ────────────────────────────────────────────────────────
-PRIMARY_PROVIDER: str = os.getenv("PRIMARY_PROVIDER", "groq")
+PRIMARY_PROVIDER: str = os.getenv("PRIMARY_PROVIDER", "gemini")
 
 # ── Agent ─────────────────────────────────────────────────────────────────────
 NEXARA_VERSION: str       = os.getenv("NEXARA_VERSION", "1.0.0")

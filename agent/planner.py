@@ -50,12 +50,14 @@ class AgentPlanner:
         system_prompt_fn: Callable[[], str],
         alert_cb: Callable[[str], Awaitable[None]],
         tools: list[dict] | None = None,
+        active_skills_fn: Callable[[], list[str]] | None = None,
     ):
-        self._loop    = react_loop
-        self._memory  = memory
-        self._sp_fn   = system_prompt_fn
-        self._alert   = alert_cb
-        self._tools   = tools
+        self._loop             = react_loop
+        self._memory           = memory
+        self._sp_fn            = system_prompt_fn
+        self._alert            = alert_cb
+        self._tools            = tools
+        self._active_skills_fn = active_skills_fn
         self._tasks:  dict[str, AutonomousTask] = {}
         self._queue:  asyncio.Queue[str]        = asyncio.Queue()
         self._worker: asyncio.Task | None       = None
@@ -142,6 +144,7 @@ class AgentPlanner:
                     history=[],
                     system_prompt=self._sp_fn(),
                     tools=self._tools,
+                    active_skills=self._active_skills_fn() if self._active_skills_fn else [],
                     status_cb=lambda m: self._alert(m),
                 )
 

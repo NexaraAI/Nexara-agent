@@ -1,10 +1,10 @@
 {
-  "version": "1.1.0",
+  "version": "1.1.1",
   "updated": "2026-03-21",
   "description": "Nexara Agent core files \u2014 OTA update manifest",
   "files": {
     "main.py": {
-      "checksum": "sha256:e6ee740f2bcb4d117beb433d8b0757bb9916fdebda621c2d22c33456250e69cd",
+      "checksum": "sha256:4c3a27b0d2cdbf31259607023032dd28b183063a692b9d2e6d9935ae8a27a3e7",
       "url": "main.py"
     },
     "config.py": {
