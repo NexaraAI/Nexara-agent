@@ -1,5 +1,8 @@
 # Nexara Agent V1.0 🤖
 
+> **Status:** Archived for now. I may return later to continue the Nexara docs and development.
+
+
 <div align="center">
 
 ![License](https://img.shields.io/badge/license-Apache%202.0-blue)
